@@ -1,0 +1,152 @@
+use automerge::{AutoCommit, ObjType, ROOT, ReadDoc, Value, transaction::Transactable};
+
+const BODY_KEY: &str = "body";
+
+/// An individual note.
+///
+/// Internally, it's an Automerge document holding one `body` field (Markdown
+/// text, YAML frontmatter included) as a character-level CRDT.
+pub struct NoteDoc {
+    doc: AutoCommit,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NoteError {
+    #[error("automerge operation failed: {0}")]
+    Automerge(#[from] automerge::AutomergeError),
+    #[error("document has no body field")]
+    MissingBody,
+    #[error("body field is not a text object")]
+    InvalidBodyType,
+}
+
+impl NoteDoc {
+    /// Creates a new note doc with the given Markdown as its initial body.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying Automerge operations fail.
+    pub fn new(markdown: &str) -> Result<Self, NoteError> {
+        let mut doc = AutoCommit::new();
+        let body = doc.put_object(ROOT, BODY_KEY, ObjType::Text)?;
+        doc.splice_text(&body, 0, 0, markdown)?;
+        Ok(Self { doc })
+    }
+
+    /// Loads a note doc from previously saved Automerge bytes.
+    ///
+    /// # Errors
+    /// Returns an error if `bytes` is not a valid Automerge document.
+    pub fn load(bytes: &[u8]) -> Result<Self, NoteError> {
+        let doc = AutoCommit::load(bytes)?;
+        Ok(Self { doc })
+    }
+
+    /// Serializes the doc to bytes for storage or transfer.
+    pub fn save(&mut self) -> Vec<u8> {
+        self.doc.save()
+    }
+
+    /// Returns the current Markdown body.
+    ///
+    /// # Errors
+    /// Returns an error if the doc has no `body` field or it isn't a text object.
+    pub fn body(&self) -> Result<String, NoteError> {
+        let body = self.body_obj()?;
+        Ok(self.doc.text(&body)?)
+    }
+
+    /// Replaces the whole body with `markdown`, diffed against the current
+    /// value so unrelated regions keep their CRDT identity. This is the
+    /// entry point for editors that hand over the full buffer on every edit.
+    ///
+    /// # Errors
+    /// Returns an error if the doc has no `body` field or it isn't a text object.
+    pub fn set_body(&mut self, markdown: &str) -> Result<(), NoteError> {
+        let body = self.body_obj()?;
+        Ok(self.doc.update_text(&body, markdown)?)
+    }
+
+    /// Splices the body at a known position, for editors that already track
+    /// precise cursor-position edits. `del` deletes after `pos` if positive,
+    /// before `pos` if negative.
+    ///
+    /// # Errors
+    /// Returns an error if the doc has no `body` field or it isn't a text object.
+    pub fn splice(&mut self, pos: usize, del: isize, text: &str) -> Result<(), NoteError> {
+        let body = self.body_obj()?;
+        Ok(self.doc.splice_text(&body, pos, del, text)?)
+    }
+
+    /// Forks this doc into an independent replica (e.g. to simulate a second
+    /// device) that can later be merged back in.
+    #[must_use]
+    pub fn fork(&mut self) -> Self {
+        Self {
+            doc: self.doc.fork(),
+        }
+    }
+
+    /// Merges changes from another replica of this note into this one.
+    ///
+    /// # Errors
+    /// Returns an error if the two docs' histories can't be merged.
+    pub fn merge(&mut self, other: &mut Self) -> Result<(), NoteError> {
+        self.doc.merge(&mut other.doc)?;
+        Ok(())
+    }
+
+    fn body_obj(&self) -> Result<automerge::ObjId, NoteError> {
+        match self.doc.get(ROOT, BODY_KEY)? {
+            Some((Value::Object(ObjType::Text), obj_id)) => Ok(obj_id),
+            Some(_) => Err(NoteError::InvalidBodyType),
+            None => Err(NoteError::MissingBody),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_and_body_round_trip() {
+        let note = NoteDoc::new("# Hello\n\nWorld").expect("valid new doc");
+        assert_eq!(note.body().expect("body present"), "# Hello\n\nWorld");
+    }
+
+    #[test]
+    fn splice_edits_a_range() {
+        let mut note = NoteDoc::new("Hello World").expect("valid new doc");
+        note.splice(6, 5, "There").expect("splice succeeds");
+        assert_eq!(note.body().expect("body present"), "Hello There");
+    }
+
+    #[test]
+    fn set_body_replaces_whole_string() {
+        let mut note = NoteDoc::new("Draft one").expect("valid new doc");
+        note.set_body("Draft two, revised")
+            .expect("set_body succeeds");
+        assert_eq!(note.body().expect("body present"), "Draft two, revised");
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let mut note = NoteDoc::new("Persisted content").expect("valid new doc");
+        let bytes = note.save();
+        let loaded = NoteDoc::load(&bytes).expect("valid saved bytes");
+        assert_eq!(loaded.body().expect("body present"), "Persisted content");
+    }
+
+    #[test]
+    fn concurrent_edits_to_different_regions_merge_cleanly() {
+        let mut original = NoteDoc::new("one two three").expect("valid new doc");
+        let mut replica = original.fork();
+
+        // Two "devices" edit disjoint parts of the same note independently.
+        original.splice(0, 3, "ONE").expect("splice succeeds");
+        replica.splice(8, 5, "THREE").expect("splice succeeds");
+
+        original.merge(&mut replica).expect("merge succeeds");
+        assert_eq!(original.body().expect("body present"), "ONE two THREE");
+    }
+}
