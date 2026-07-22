@@ -135,6 +135,10 @@ impl Vault {
     /// # Errors
     /// Returns an error if the id is unknown or the stored bytes are invalid.
     pub fn get_note(&self, id: &str) -> Result<NoteDoc, VaultError> {
+        // Notes and the root doc's own bytes share one `Store`, so a
+        // registration check keeps `get_note` from hydrating the reserved
+        // `"vault"` id (or any orphaned id) as if it were a note.
+        self.entry_obj(id)?;
         let bytes = self
             .store
             .get(id)?
@@ -182,9 +186,12 @@ impl Vault {
         if self.root.get(&notes, id)?.is_none() {
             return Err(VaultError::NoteNotFound(id.to_string()));
         }
+        // Persist the metadata removal *before* deleting the bytes: if the
+        // persist fails (disk full, permissions), the note stays fully
+        // intact and recoverable rather than listed-but-unreadable.
         self.root.delete(&notes, id)?;
-        self.store.delete(id)?;
-        self.persist()
+        self.persist()?;
+        self.store.delete(id)
     }
 
     /// Lists notes' metadata, paginated by `offset`/`limit`. Reads only the
@@ -477,5 +484,68 @@ mod tests {
             Vault::load_existing(store),
             Err(VaultError::NoRootDoc)
         ));
+    }
+
+    #[test]
+    fn get_note_rejects_reserved_vault_id() {
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
+        // Put the root doc's own bytes under the reserved id, so this only
+        // passes if `get_note` checks registration rather than raw presence.
+        vault.persist().unwrap();
+        assert!(matches!(
+            vault.get_note(VAULT_ID),
+            Err(VaultError::NoteNotFound(_))
+        ));
+    }
+
+    /// Wraps a store so a single `put` can be made to fail on demand, to
+    /// prove a failed `delete_note` leaves the note recoverable.
+    #[derive(Clone, Default)]
+    struct FaultyStore {
+        inner: InMemoryStore,
+        fail_put: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Store for FaultyStore {
+        fn get(&self, id: &str) -> Result<Option<Vec<u8>>, VaultError> {
+            self.inner.get(id)
+        }
+
+        fn put(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), VaultError> {
+            if self.fail_put.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(VaultError::Io(std::io::Error::other("injected put failure")));
+            }
+            self.inner.put(id, bytes)
+        }
+
+        fn delete(&mut self, id: &str) -> Result<(), VaultError> {
+            self.inner.delete(id)
+        }
+    }
+
+    #[test]
+    fn delete_note_leaves_note_recoverable_when_persist_fails() {
+        let store = FaultyStore::default();
+        let mut vault = Vault::new(store.clone()).unwrap();
+        let (id, _note) = vault.create_note("a.md", "A", "irreplaceable").unwrap();
+        vault.persist().unwrap();
+
+        // Arm the fault so the persist inside `delete_note` fails.
+        store
+            .fail_put
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(vault.delete_note(&id).is_err());
+
+        // Reopen from the shared backing store: the note must be intact,
+        // both in metadata and in its readable bytes.
+        store
+            .fail_put
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reopened = Vault::load_existing(store).unwrap();
+        assert_eq!(reopened.list_notes(0, 10).len(), 1);
+        assert_eq!(
+            reopened.get_note(&id).unwrap().body().unwrap(),
+            "irreplaceable"
+        );
     }
 }
