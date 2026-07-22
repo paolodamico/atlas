@@ -11,21 +11,21 @@ A command-line client over `atlas-core`, and the vehicle for the offline-sync de
 ## Walkthrough: concurrent offline edits merge without loss
 
 ```sh
-atlas --vault ./A init
-atlas --vault ./B init
+atlas --vault ./alpha init
+atlas --vault ./beta init
 
-atlas --vault ./A add n.md --title Note --body "one two three"
-atlas --vault ./B sync ./A            # B pulls the note from A
+atlas --vault ./alpha add n.md --title Note --body "one two three"
+atlas --vault ./beta sync ./alpha            # beta pulls the note from alpha
 
 # Both devices edit the same note while "offline":
-atlas --vault ./A edit n.md --body "ONE two three"
-atlas --vault ./B edit n.md --body "one two THREE"
+atlas --vault ./alpha edit n.md --body "ONE two three"
+atlas --vault ./beta edit n.md --body "one two THREE"
 
-atlas --vault ./A sync ./B            # each side pulls the other
-atlas --vault ./B sync ./A
+atlas --vault ./alpha sync ./beta            # each side pulls the other
+atlas --vault ./beta sync ./alpha
 
-atlas --vault ./A show n.md           # ONE two THREE
-atlas --vault ./B show n.md           # ONE two THREE
+atlas --vault ./alpha show n.md           # ONE two THREE
+atlas --vault ./beta show n.md           # ONE two THREE
 ```
 
 ## Run from the workspace
