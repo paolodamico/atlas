@@ -6,16 +6,22 @@ const BODY_KEY: &str = "body";
 ///
 /// Internally, it's an Automerge document holding one `body` field (Markdown
 /// text, YAML frontmatter included) as a character-level CRDT.
+// TODO: expose doc heads (e.g. a `heads()` accessor) once the History doc
+// needs to record snapshot pointers against this note's changes.
 pub struct NoteDoc {
     doc: AutoCommit,
 }
 
+/// Errors returned by [`NoteDoc`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NoteError {
+    /// The underlying Automerge document operation failed.
     #[error("automerge operation failed: {0}")]
     Automerge(#[from] automerge::AutomergeError),
+    /// The doc has no `body` field at all.
     #[error("document has no body field")]
     MissingBody,
+    /// The doc's `body` field exists but isn't a text object.
     #[error("body field is not a text object")]
     InvalidBodyType,
 }
@@ -105,48 +111,48 @@ impl NoteDoc {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
 mod tests {
     use super::*;
 
     #[test]
     fn new_and_body_round_trip() {
-        let note = NoteDoc::new("# Hello\n\nWorld").expect("valid new doc");
-        assert_eq!(note.body().expect("body present"), "# Hello\n\nWorld");
+        let note = NoteDoc::new("# Hello\n\nWorld").unwrap();
+        assert_eq!(note.body().unwrap(), "# Hello\n\nWorld");
     }
 
     #[test]
     fn splice_edits_a_range() {
-        let mut note = NoteDoc::new("Hello World").expect("valid new doc");
-        note.splice(6, 5, "There").expect("splice succeeds");
-        assert_eq!(note.body().expect("body present"), "Hello There");
+        let mut note = NoteDoc::new("Hello World").unwrap();
+        note.splice(6, 5, "There").unwrap();
+        assert_eq!(note.body().unwrap(), "Hello There");
     }
 
     #[test]
     fn set_body_replaces_whole_string() {
-        let mut note = NoteDoc::new("Draft one").expect("valid new doc");
-        note.set_body("Draft two, revised")
-            .expect("set_body succeeds");
-        assert_eq!(note.body().expect("body present"), "Draft two, revised");
+        let mut note = NoteDoc::new("Draft one").unwrap();
+        note.set_body("Draft two, revised").unwrap();
+        assert_eq!(note.body().unwrap(), "Draft two, revised");
     }
 
     #[test]
     fn save_and_load_round_trip() {
-        let mut note = NoteDoc::new("Persisted content").expect("valid new doc");
+        let mut note = NoteDoc::new("Persisted content").unwrap();
         let bytes = note.save();
-        let loaded = NoteDoc::load(&bytes).expect("valid saved bytes");
-        assert_eq!(loaded.body().expect("body present"), "Persisted content");
+        let loaded = NoteDoc::load(&bytes).unwrap();
+        assert_eq!(loaded.body().unwrap(), "Persisted content");
     }
 
     #[test]
     fn concurrent_edits_to_different_regions_merge_cleanly() {
-        let mut original = NoteDoc::new("one two three").expect("valid new doc");
+        let mut original = NoteDoc::new("one two three").unwrap();
         let mut replica = original.fork();
 
         // Two "devices" edit disjoint parts of the same note independently.
-        original.splice(0, 3, "ONE").expect("splice succeeds");
-        replica.splice(8, 5, "THREE").expect("splice succeeds");
+        original.splice(0, 3, "ONE").unwrap();
+        replica.splice(8, 5, "THREE").unwrap();
 
-        original.merge(&mut replica).expect("merge succeeds");
-        assert_eq!(original.body().expect("body present"), "ONE two THREE");
+        original.merge(&mut replica).unwrap();
+        assert_eq!(original.body().unwrap(), "ONE two THREE");
     }
 }
