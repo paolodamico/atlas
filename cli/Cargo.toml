@@ -1,0 +1,19 @@
+[package]
+name = "atlas-cli"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "atlas"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+atlas-core = { path = "../core" }
+clap = { version = "4.6.4", features = ["derive"] }
