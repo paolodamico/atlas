@@ -29,8 +29,13 @@ pub fn run(cli: Cli) -> Result<()> {
 fn init(dir: &Path) -> Result<()> {
     let store =
         FileStore::new(dir).with_context(|| format!("creating vault at {}", dir.display()))?;
-    if Vault::load_existing(store.clone()).is_ok() {
-        bail!("vault already initialized at {}", dir.display());
+    match Vault::load_existing(store.clone()) {
+        Ok(_) => bail!("vault already initialized at {}", dir.display()),
+        Err(VaultError::NoRootDoc) => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("cannot read existing vault at {}", dir.display())));
+        }
     }
     let mut vault = Vault::new(store)?;
     vault.persist()?;
