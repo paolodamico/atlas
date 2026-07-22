@@ -1,73 +1,107 @@
-use std::collections::HashMap;
+use std::path::PathBuf;
 
 use automerge::{
     AutoCommit, ObjType, ROOT, ReadDoc, ScalarValue, Value, transaction::Transactable,
 };
 use uuid::Uuid;
 
+use crate::storage::Store;
 use crate::{NoteDoc, NoteError};
 
 const NOTES_KEY: &str = "notes";
 const PATH_KEY: &str = "path";
 const TITLE_KEY: &str = "title";
+/// Reserved id the vault's root-doc is stored under
+const VAULT_ID: &str = "vault";
 
-/// The main struct which holds the entire app state for the user.
+/// Primary state.
 ///
-/// A vault holds all the required metadata about notes, and all the relevant
-/// pointers (note content stored separately).
+/// Holds all the required metadata about notes, and all the relevant
+/// pointers. Everything (the root doc's own bytes, under the reserved id
+/// `"vault"`, and every note's bytes, under its own id) lives in one
+/// [`Store`] (fs by default) — the crate manages what goes where, callers
+/// just supply a backend.
+///
+/// In `automerge` context this is the Root doc.
 pub struct Vault {
     root: AutoCommit,
-    // TODO: stand-in for the real storage/repo layer. Once that exists,
-    // note bytes should live on disk (encrypted) and be addressed by real
-    // repo document ids
-    store: HashMap<String, Vec<u8>>,
+    store: Box<dyn Store>,
 }
 
-/// Cheap-to-list metadata about a note, without loading its body.
+/// Metadata about a note.
+///
+/// This should remain a lightweight struct, as it is used frequently in UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteSummary {
-    /// The note's stable id within this vault.
+    /// Stable id within the vault.
     pub id: String,
-    /// The note's file path within the vault.
+    /// File path within the vault.
     pub path: String,
-    /// The note's cached display title.
+    /// Cached display title.
     pub title: String,
 }
 
 impl Vault {
-    /// Creates an empty vault.
+    /// Creates a vault with a fresh, empty root doc, backed by `store`.
     ///
     /// # Errors
     /// Returns an error if the underlying Automerge operations fail.
-    pub fn new() -> Result<Self, VaultError> {
+    pub fn new(store: impl Store + 'static) -> Result<Self, VaultError> {
         let mut root = AutoCommit::new();
         root.put_object(ROOT, NOTES_KEY, ObjType::Map)?;
         Ok(Self {
             root,
-            store: HashMap::new(),
+            store: Box::new(store),
         })
     }
 
-    /// Loads a vault's metadata from previously saved bytes.
-    // TODO: once a real storage layer exists, `load` should also rehydrate
-    // `store` (e.g. from disk) so `get_note` works right after loading,
-    // instead of leaving every note unavailable until re-created/re-attached.
+    /// Loads a vault whose root-doc bytes already exist in `store` (under
+    /// the reserved id [`VAULT_ID`]). Errors if they don't — see
+    /// [`Vault::load`] for a version that creates a fresh vault instead.
     ///
     /// # Errors
-    /// Returns an error if `bytes` is not a valid Automerge document.
-    pub fn load(bytes: &[u8]) -> Result<Self, VaultError> {
-        let root = AutoCommit::load(bytes)?;
+    /// Returns [`VaultError::NoRootDoc`] if `store` has nothing stored under
+    /// that id, or an error if the bytes aren't a valid Automerge document.
+    pub fn load_existing(store: impl Store + 'static) -> Result<Self, VaultError> {
+        let bytes = store.get(VAULT_ID)?.ok_or(VaultError::NoRootDoc)?;
+        let root = AutoCommit::load(&bytes)?;
         Ok(Self {
             root,
-            store: HashMap::new(),
+            store: Box::new(store),
         })
     }
 
-    /// Serializes the vault's metadata (not note bodies) to bytes.
-    // TODO: `save` only covers root-doc metadata; persisting `store`'s note
-    // bytes alongside it is the same storage-layer gap as `load`, above.
-    pub fn save(&mut self) -> Vec<u8> {
+    /// Serializes the vault's metadata (notes are **not** included) to bytes.
+    pub fn to_bytes(&mut self) -> Vec<u8> {
         self.root.save()
+    }
+
+    /// Loads a vault backed by `store`, or creates a fresh one if `store`
+    /// doesn't have one yet. This is the usual entry point (e.g.
+    /// `Vault::load(FileStore::new(dir)?)`), since it doesn't require the
+    /// caller to know ahead of time whether the backend is new or
+    /// pre-existing.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying Automerge operations fail.
+    pub fn load(store: impl Store + 'static) -> Result<Self, VaultError> {
+        if store.get(VAULT_ID)?.is_some() {
+            Self::load_existing(store)
+        } else {
+            Self::new(store)
+        }
+    }
+
+    /// Writes the vault's metadata to `store` (atomically, if disk backed).
+    /// Structural changes (`create_note`/`rename_note`/`move_note`/
+    /// `delete_note`) already call this automatically, so it's exposed
+    /// mainly as a manual checkpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub fn persist(&mut self) -> Result<(), VaultError> {
+        let bytes = self.to_bytes();
+        self.store.put(VAULT_ID, bytes)
     }
 
     /// Creates a new note, storing its bytes and registering it in the
@@ -84,17 +118,18 @@ impl Vault {
     ) -> Result<(String, NoteDoc), VaultError> {
         let id = Self::mint_note_id();
         let mut note = NoteDoc::new(initial_markdown)?;
-        self.store.insert(id.clone(), note.save());
+        self.store.put(&id, note.to_bytes())?;
 
         let notes = self.notes_obj()?;
         let entry = self.root.put_object(&notes, id.as_str(), ObjType::Map)?;
         self.root.put(&entry, PATH_KEY, path)?;
         self.root.put(&entry, TITLE_KEY, title)?;
+        self.persist()?;
 
         Ok((id, note))
     }
 
-    /// Hydrates the note with the given id from the vault's store. This is
+    /// Hydrates the note with the given id from the store. This is
     /// the only place a note's body is loaded into memory.
     ///
     /// # Errors
@@ -102,18 +137,19 @@ impl Vault {
     pub fn get_note(&self, id: &str) -> Result<NoteDoc, VaultError> {
         let bytes = self
             .store
-            .get(id)
+            .get(id)?
             .ok_or_else(|| VaultError::NoteNotFound(id.to_string()))?;
-        Ok(NoteDoc::load(bytes)?)
+        Ok(NoteDoc::load(&bytes)?)
     }
 
-    /// Persists `note`'s current bytes back into the vault.
+    /// Persists `note`'s current bytes back into the vault. Doesn't touch
+    /// title/path — use [`Vault::rename_note`]/[`Vault::move_note`] for that.
     ///
     /// # Errors
     /// Returns an error if the id is unknown.
     pub fn update_note(&mut self, id: &str, note: &mut NoteDoc) -> Result<(), VaultError> {
         self.entry_obj(id)?;
-        self.store.insert(id.to_string(), note.save());
+        self.store.put(id, note.to_bytes())?;
         Ok(())
     }
 
@@ -124,7 +160,7 @@ impl Vault {
     pub fn rename_note(&mut self, id: &str, title: &str) -> Result<(), VaultError> {
         let entry = self.entry_obj(id)?;
         self.root.put(&entry, TITLE_KEY, title)?;
-        Ok(())
+        self.persist()
     }
 
     /// Moves a note to a new path (identity is unaffected).
@@ -134,7 +170,7 @@ impl Vault {
     pub fn move_note(&mut self, id: &str, new_path: &str) -> Result<(), VaultError> {
         let entry = self.entry_obj(id)?;
         self.root.put(&entry, PATH_KEY, new_path)?;
-        Ok(())
+        self.persist()
     }
 
     /// Permanently deletes a note from the vault.
@@ -147,16 +183,13 @@ impl Vault {
             return Err(VaultError::NoteNotFound(id.to_string()));
         }
         self.root.delete(&notes, id)?;
-        self.store.remove(id);
-        Ok(())
+        self.store.delete(id)?;
+        self.persist()
     }
 
     /// Lists notes' metadata, paginated by `offset`/`limit`. Reads only the
     /// root doc's note list — never hydrates a note body.
-    // TODO: no defined ordering yet. This currently returns whatever order
-    // Automerge's map iteration happens to yield, which isn't a stable
-    // guarantee. Add real sorting (title, recency, etc.) once it's clear
-    // what the UI actually needs.
+    // TODO: ordering
     #[must_use]
     pub fn list_notes(&self, offset: usize, limit: usize) -> Vec<NoteSummary> {
         let Ok(notes) = self.notes_obj() else {
@@ -226,6 +259,17 @@ pub enum VaultError {
     /// No note with the given id exists in this vault.
     #[error("no note with id {0}")]
     NoteNotFound(String),
+    /// A storage read/write failed.
+    #[error("storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A path used internally by the storage layer has no parent directory
+    /// or file name component (e.g. it's empty or a filesystem root).
+    #[error("invalid storage path: {0:?}")]
+    InvalidPath(PathBuf),
+    /// [`Vault::load_existing`] was called with a `store` that has no root
+    /// doc bytes stored under the reserved id.
+    #[error("no root doc found in the given store")]
+    NoRootDoc,
     /// An error that doesn't fit the other variants above.
     #[error("unexpected error: {0}")]
     UnexpectedError(String),
@@ -235,10 +279,11 @@ pub enum VaultError {
 #[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
 mod tests {
     use super::*;
+    use crate::storage::{FileStore, InMemoryStore};
 
     #[test]
     fn create_and_list_notes() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let (id, _note) = vault
             .create_note("ideas/atlas.md", "Atlas", "# Atlas\n\nBrain extension")
             .unwrap();
@@ -252,7 +297,7 @@ mod tests {
 
     #[test]
     fn note_ids_are_not_sequential_or_reused() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let (id1, _) = vault.create_note("a.md", "A", "content").unwrap();
         let (id2, _) = vault.create_note("b.md", "B", "content").unwrap();
         assert_ne!(id1, id2);
@@ -260,7 +305,7 @@ mod tests {
 
     #[test]
     fn get_note_hydrates_created_content() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let (id, _note) = vault.create_note("a.md", "A", "Hello vault").unwrap();
 
         let fetched = vault.get_note(&id).unwrap();
@@ -269,7 +314,7 @@ mod tests {
 
     #[test]
     fn update_note_persists_body() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let (id, mut note) = vault.create_note("a.md", "A", "Original body").unwrap();
 
         note.set_body("Updated body").unwrap();
@@ -281,7 +326,7 @@ mod tests {
 
     #[test]
     fn list_notes_paginates() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let mut ids: Vec<_> = ["Charlie", "Alice", "Bob"]
             .iter()
             .map(|title| {
@@ -305,7 +350,7 @@ mod tests {
 
     #[test]
     fn rename_move_and_delete_note() {
-        let mut vault = Vault::new().unwrap();
+        let mut vault = Vault::new(InMemoryStore::default()).unwrap();
         let (id, _note) = vault.create_note("a.md", "A", "content").unwrap();
 
         vault.rename_note(&id, "Renamed").unwrap();
@@ -324,13 +369,16 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_round_trips_metadata() {
-        let mut vault = Vault::new().unwrap();
+    fn persist_and_reload_round_trips_metadata() {
+        // A cloned `InMemoryStore` shares the same backing map, standing in
+        // for two `FileStore`s pointed at the same directory.
+        let store = InMemoryStore::default();
+        let mut vault = Vault::new(store.clone()).unwrap();
         vault.create_note("a.md", "A", "content a").unwrap();
         vault.create_note("b.md", "B", "content b").unwrap();
+        vault.persist().unwrap();
 
-        let bytes = vault.save();
-        let loaded = Vault::load(&bytes).unwrap();
+        let loaded = Vault::load_existing(store).unwrap();
 
         let original_titles: Vec<_> = vault
             .list_notes(0, 10)
@@ -343,5 +391,91 @@ mod tests {
             .map(|s| s.title)
             .collect();
         assert_eq!(original_titles, loaded_titles);
+    }
+
+    #[test]
+    fn load_on_empty_dir_creates_empty_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path()).unwrap();
+        let vault = Vault::load(store).unwrap();
+        assert!(vault.list_notes(0, 10).is_empty());
+    }
+
+    #[test]
+    fn note_content_and_metadata_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path()).unwrap();
+        let mut vault = Vault::load(store).unwrap();
+        let (id, _note) = vault.create_note("a.md", "A", "Hello disk").unwrap();
+        // No explicit `persist()`, `create_note` auto-persists metadata.
+        drop(vault);
+
+        let store = FileStore::new(dir.path()).unwrap();
+        let reopened = Vault::load(store).unwrap();
+        let summaries = reopened.list_notes(0, 10);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, id);
+        assert_eq!(summaries[0].title, "A");
+        assert_eq!(
+            reopened.get_note(&id).unwrap().body().unwrap(),
+            "Hello disk"
+        );
+    }
+
+    #[test]
+    fn update_note_survives_reopen_without_explicit_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path()).unwrap();
+        let mut vault = Vault::load(store.clone()).unwrap();
+        let (id, mut note) = vault.create_note("a.md", "A", "Original").unwrap();
+        note.set_body("Edited on disk").unwrap();
+        vault.update_note(&id, &mut note).unwrap();
+        drop(vault);
+
+        let reopened = Vault::load(store).unwrap();
+        assert_eq!(
+            reopened.get_note(&id).unwrap().body().unwrap(),
+            "Edited on disk"
+        );
+    }
+
+    #[test]
+    fn delete_note_deletes_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path()).unwrap();
+        let mut vault = Vault::load(store.clone()).unwrap();
+        let (id, _note) = vault.create_note("a.md", "A", "content").unwrap();
+        vault.delete_note(&id).unwrap();
+        drop(vault);
+
+        let reopened = Vault::load(store).unwrap();
+        assert!(reopened.list_notes(0, 10).is_empty());
+        assert!(matches!(
+            reopened.get_note(&id),
+            Err(VaultError::NoteNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_changes_auto_persist_without_explicit_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path()).unwrap();
+        let mut vault = Vault::load(store.clone()).unwrap();
+        let (id, _note) = vault.create_note("a.md", "A", "content").unwrap();
+        vault.rename_note(&id, "Renamed").unwrap();
+        // No explicit `persist()` call anywhere in this test on purpose.
+        drop(vault);
+
+        let reopened = Vault::load(store).unwrap();
+        assert_eq!(reopened.list_notes(0, 10)[0].title, "Renamed");
+    }
+
+    #[test]
+    fn load_existing_on_empty_store_errors() {
+        let store = InMemoryStore::default();
+        assert!(matches!(
+            Vault::load_existing(store),
+            Err(VaultError::NoRootDoc)
+        ));
     }
 }
