@@ -9,6 +9,7 @@ version = "0.0.1"
 authors = [
     "Paolo D'Amico <5864173+paolodamico@users.noreply.github.com>",
 ]
+license = "MIT"
 
 [workspace.lints.rust]
 missing_docs = "deny"

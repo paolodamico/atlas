@@ -151,19 +151,22 @@ impl Vault {
         Ok(())
     }
 
-    /// Lists notes' metadata, sorted by title, paginated by `offset`/`limit`.
-    /// Reads only the root doc's note list — never hydrates a note body.
+    /// Lists notes' metadata, paginated by `offset`/`limit`. Reads only the
+    /// root doc's note list — never hydrates a note body.
+    // TODO: no defined ordering yet. This currently returns whatever order
+    // Automerge's map iteration happens to yield, which isn't a stable
+    // guarantee. Add real sorting (title, recency, etc.) once it's clear
+    // what the UI actually needs.
     #[must_use]
     pub fn list_notes(&self, offset: usize, limit: usize) -> Vec<NoteSummary> {
         let Ok(notes) = self.notes_obj() else {
             return Vec::new();
         };
-        let mut summaries: Vec<NoteSummary> = self
+        let summaries: Vec<NoteSummary> = self
             .root
             .keys(&notes)
             .filter_map(|id| self.summary_of(&notes, &id))
             .collect();
-        summaries.sort_by(|a, b| a.title.cmp(&b.title));
         summaries.into_iter().skip(offset).take(limit).collect()
     }
 
@@ -277,24 +280,27 @@ mod tests {
     }
 
     #[test]
-    fn list_notes_paginates_in_title_order() {
+    fn list_notes_paginates() {
         let mut vault = Vault::new().unwrap();
-        for title in ["Charlie", "Alice", "Bob"] {
-            vault
-                .create_note(&format!("{title}.md"), title, "content")
-                .unwrap();
-        }
+        let mut ids: Vec<_> = ["Charlie", "Alice", "Bob"]
+            .iter()
+            .map(|title| {
+                vault
+                    .create_note(&format!("{title}.md"), title, "content")
+                    .unwrap()
+                    .0
+            })
+            .collect();
 
         let page1 = vault.list_notes(0, 2);
         let page2 = vault.list_notes(2, 2);
-        assert_eq!(
-            page1.iter().map(|s| &s.title).collect::<Vec<_>>(),
-            vec!["Alice", "Bob"]
-        );
-        assert_eq!(
-            page2.iter().map(|s| &s.title).collect::<Vec<_>>(),
-            vec!["Charlie"]
-        );
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 1);
+
+        let mut paged_ids: Vec<_> = page1.iter().chain(&page2).map(|s| s.id.clone()).collect();
+        paged_ids.sort();
+        ids.sort();
+        assert_eq!(paged_ids, ids);
     }
 
     #[test]

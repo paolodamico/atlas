@@ -1,0 +1,91 @@
+name: CI
+
+# Unless we are on the main branch, stop and yield to a new run if new code is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ !contains(github.ref, 'main')}}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format, Clippy & Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (https://github.com/actions/checkout/releases/tag/v6.0.2)
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch HEAD as of 2026-05-20 (https://github.com/dtolnay/rust-toolchain/tree/stable)
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+
+      - name: Check code formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (https://github.com/actions/checkout/releases/tag/v6.0.2)
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch HEAD as of 2026-05-20 (https://github.com/dtolnay/rust-toolchain/tree/stable)
+        with:
+          toolchain: stable
+
+      - name: Run tests
+        run: |
+          cargo test
+
+      - name: Build non-default features
+        run: |
+          cargo build
+
+  deny:
+    name: Cargo deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (https://github.com/actions/checkout/releases/tag/v6.0.2)
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18 (https://github.com/EmbarkStudios/cargo-deny-action/releases/tag/v2.0.18)
+        with:
+          command: check ${{ matrix.checks }}
+          rust-version: 1.97
