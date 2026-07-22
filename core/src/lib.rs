@@ -5,5 +5,5 @@ mod storage;
 mod vault;
 
 pub use note::{NoteDoc, NoteError};
-pub use storage::{FileNoteStore, NoteStore};
+pub use storage::{FileStore, Store};
 pub use vault::{NoteSummary, Vault, VaultError};

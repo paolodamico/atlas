@@ -48,7 +48,7 @@ impl NoteDoc {
     }
 
     /// Serializes the doc to bytes for storage or transfer.
-    pub fn save(&mut self) -> Vec<u8> {
+    pub fn to_bytes(&mut self) -> Vec<u8> {
         self.doc.save()
     }
 
@@ -136,9 +136,9 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_round_trip() {
+    fn to_bytes_and_load_round_trip() {
         let mut note = NoteDoc::new("Persisted content").unwrap();
-        let bytes = note.save();
+        let bytes = note.to_bytes();
         let loaded = NoteDoc::load(&bytes).unwrap();
         assert_eq!(loaded.body().unwrap(), "Persisted content");
     }

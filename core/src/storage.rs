@@ -1,41 +1,45 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use crate::VaultError;
 
-/// Defines behavior of a note storage backend.
-pub trait NoteStore: Send {
-    /// Returns `Ok(None)` if no note with this id has been stored yet
+/// Defines behavior for a storage backend. The store is keyed by `id`.
+///
+/// This is generally used for both storing notes and the vault's root document.
+pub trait Store: Send {
+    /// Returns `Ok(None)` if nothing has been stored under this id yet.
     ///
     /// # Errors
     /// Returns an error if the underlying storage can't be read.
     fn get(&self, id: &str) -> Result<Option<Vec<u8>>, VaultError>;
 
-    /// Stores (or replaces) a note's bytes.
+    /// Stores (or replaces) the bytes at `id`.
     ///
     /// # Errors
     /// Returns an error if the underlying storage can't be written.
     fn put(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), VaultError>;
 
-    /// Deletes a note's bytes. Deleting an id that isn't present is not an
-    /// error.
+    /// Deletes the bytes at `id`. Deleting an id that isn't present is not
+    /// an error.
     ///
     /// # Errors
     /// Returns an error if the underlying storage can't be written.
     fn delete(&mut self, id: &str) -> Result<(), VaultError>;
 }
 
-/// Default storage engine using the host's filesystem.
+/// Default [`Store`] using the host's filesystem.
 ///
-/// Each note is stored as `<dir>/<id>.atlas`.
-#[derive(Debug)]
-pub struct FileNoteStore {
+/// Each id is stored as `<dir>/<id>.atlas`.
+#[derive(Debug, Clone)]
+pub struct FileStore {
     dir: PathBuf,
 }
 
-impl FileNoteStore {
-    /// Opens (creating if necessary) a note store rooted at `dir`.
+impl FileStore {
+    /// Opens (creating if necessary) a store rooted at `dir`.
     ///
     /// # Errors
     /// Returns an error if `dir` can't be created.
@@ -50,7 +54,7 @@ impl FileNoteStore {
     }
 }
 
-impl NoteStore for FileNoteStore {
+impl Store for FileStore {
     fn get(&self, id: &str) -> Result<Option<Vec<u8>>, VaultError> {
         match std::fs::read(self.path_for(id)) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -89,25 +93,33 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> 
     Ok(())
 }
 
-/// In-memory [`NoteStore`], for tests only. Nothing here survives past the
-/// process; real callers want [`FileNoteStore`] via [`Vault::open`](crate::Vault::open).
+/// In-memory [`Store`], for tests only. Clones shares the same state.
 #[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct InMemoryNoteStore(HashMap<String, Vec<u8>>);
+#[derive(Debug, Default, Clone)]
+pub(crate) struct InMemoryStore(Arc<Mutex<HashMap<String, Vec<u8>>>>);
 
 #[cfg(test)]
-impl NoteStore for InMemoryNoteStore {
+impl InMemoryStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+impl Store for InMemoryStore {
     fn get(&self, id: &str) -> Result<Option<Vec<u8>>, VaultError> {
-        Ok(self.0.get(id).cloned())
+        Ok(self.lock().get(id).cloned())
     }
 
     fn put(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), VaultError> {
-        self.0.insert(id.to_string(), bytes);
+        self.lock().insert(id.to_string(), bytes);
         Ok(())
     }
 
     fn delete(&mut self, id: &str) -> Result<(), VaultError> {
-        self.0.remove(id);
+        self.lock().remove(id);
         Ok(())
     }
 }
