@@ -18,3 +18,46 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
+
+/// A top-level command.
+#[derive(Subcommand)]
+pub enum Command {
+    /// Create a new, empty vault.
+    Init,
+    /// Add a note (body from --body, otherwise read from stdin).
+    Add {
+        /// Path of the note within the vault.
+        path: String,
+        /// Display title (defaults to the path).
+        #[arg(short, long)]
+        title: Option<String>,
+        /// Note body. If omitted, read from stdin.
+        #[arg(short, long)]
+        body: Option<String>,
+    },
+    /// List all notes in the vault.
+    List,
+    /// Print a note's body.
+    Show {
+        /// Note id, unique id prefix, or exact path.
+        note: String,
+    },
+    /// Replace a note's body (body from --body, otherwise read from stdin).
+    Edit {
+        /// Note id, unique id prefix, or exact path.
+        note: String,
+        /// New body. If omitted, read from stdin.
+        #[arg(short, long)]
+        body: Option<String>,
+    },
+    /// Delete a note.
+    Rm {
+        /// Note id, unique id prefix, or exact path.
+        note: String,
+    },
+    /// Pull another vault's changes into this one.
+    Sync {
+        /// The other vault's directory.
+        other: PathBuf,
+    },
+}
