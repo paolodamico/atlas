@@ -102,6 +102,9 @@ pub enum SyncError {
     /// A blob could not be decrypted.
     #[error("decryption failed: {0}")]
     Cipher(String),
+    /// The relay returned a snapshot, which this client cannot apply yet.
+    #[error("relay returned an unsupported snapshot")]
+    Snapshot,
     /// A stored envelope or sync-state was not readable.
     #[error("malformed sync data: {0}")]
     Malformed(String),
@@ -174,6 +177,11 @@ impl Vault {
         let pushed = outgoing.len();
 
         let delta = transport.sync(graph, state.cursor, outgoing)?;
+        if delta.snapshot.is_some() {
+            // Snapshot hydration is not built yet; advancing the cursor here
+            // would skip data we never applied, so fail instead of dropping it.
+            return Err(SyncError::Snapshot);
+        }
         let pulled = delta.changes.len();
         self.apply_incoming(delta.changes, &cipher)?;
         self.persist()?;
@@ -385,6 +393,31 @@ mod tests {
 
         assert_eq!(a.get_note(&id).unwrap().body().unwrap(), "ONE two THREE");
         assert_eq!(b.get_note(&id).unwrap().body().unwrap(), "ONE two THREE");
+    }
+
+    #[test]
+    fn a_relay_snapshot_is_rejected_not_silently_skipped() {
+        struct Snapshotting;
+        impl Transport for Snapshotting {
+            fn sync(
+                &mut self,
+                _graph: &str,
+                _since: Option<Cursor>,
+                _outgoing: Vec<Vec<u8>>,
+            ) -> Result<Delta, TransportError> {
+                Ok(Delta {
+                    changes: Vec::new(),
+                    cursor: Cursor { epoch: 1, seq: 0 },
+                    snapshot: Some(vec![1, 2, 3]),
+                })
+            }
+        }
+
+        let mut a = vault();
+        let result = a.sync("g", &mut Snapshotting);
+        assert!(matches!(result, Err(SyncError::Snapshot)));
+        // The cursor was not advanced, so a retry still starts from scratch.
+        assert!(a.load_sync_state("g").unwrap().cursor.is_none());
     }
 
     #[test]
