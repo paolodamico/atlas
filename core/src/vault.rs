@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use automerge::{
-    AutoCommit, ObjType, ROOT, ReadDoc, ScalarValue, Value, transaction::Transactable,
+    AutoCommit, Change, ChangeHash, ObjType, ROOT, ReadDoc, ScalarValue, Value,
+    transaction::Transactable,
 };
 use uuid::Uuid;
 
@@ -118,6 +119,27 @@ impl Vault {
             .keys(ROOT)
             .filter(|k| k.starts_with(NOTE_ID_PREFIX))
             .collect()
+    }
+
+    pub(crate) fn root_heads(&mut self) -> Vec<ChangeHash> {
+        self.root.get_heads()
+    }
+
+    pub(crate) fn root_changes_since(&mut self, have: &[ChangeHash]) -> Vec<Vec<u8>> {
+        self.root
+            .get_changes(have)
+            .iter()
+            .map(|c| c.raw_bytes().to_vec())
+            .collect()
+    }
+
+    pub(crate) fn root_apply(&mut self, blobs: Vec<Vec<u8>>) -> Result<(), VaultError> {
+        let mut changes = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            changes.push(Change::from_bytes(blob)?);
+        }
+        self.root.apply_changes(changes)?;
+        Ok(())
     }
 
     /// Reads a note's raw stored bytes, bypassing the registration check
@@ -280,6 +302,9 @@ pub enum VaultError {
     /// A storage read/write failed.
     #[error("storage I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A received change could not be decoded.
+    #[error("invalid change bytes: {0}")]
+    Change(#[from] automerge::LoadChangeError),
     /// A path used internally by the storage layer has no parent directory
     /// or file name component (e.g. it's empty or a filesystem root).
     #[error("invalid storage path: {0:?}")]

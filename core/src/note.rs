@@ -1,4 +1,6 @@
-use automerge::{AutoCommit, ObjType, ROOT, ReadDoc, Value, transaction::Transactable};
+use automerge::{
+    AutoCommit, Change, ChangeHash, ObjType, ROOT, ReadDoc, Value, transaction::Transactable,
+};
 
 const BODY_KEY: &str = "body";
 
@@ -24,6 +26,9 @@ pub enum NoteError {
     /// The doc's `body` field exists but isn't a text object.
     #[error("body field is not a text object")]
     InvalidBodyType,
+    /// A received change could not be decoded.
+    #[error("invalid change bytes: {0}")]
+    Change(#[from] automerge::LoadChangeError),
 }
 
 impl NoteDoc {
@@ -98,6 +103,34 @@ impl NoteDoc {
     /// Returns an error if the two docs' histories can't be merged.
     pub fn merge(&mut self, other: &mut Self) -> Result<(), NoteError> {
         self.doc.merge(&mut other.doc)?;
+        Ok(())
+    }
+
+    /// Empty doc with no body, populated by [`NoteDoc::apply`] during sync.
+    pub(crate) fn empty() -> Self {
+        Self {
+            doc: AutoCommit::new(),
+        }
+    }
+
+    pub(crate) fn heads(&mut self) -> Vec<ChangeHash> {
+        self.doc.get_heads()
+    }
+
+    pub(crate) fn changes_since(&mut self, have: &[ChangeHash]) -> Vec<Vec<u8>> {
+        self.doc
+            .get_changes(have)
+            .iter()
+            .map(|c| c.raw_bytes().to_vec())
+            .collect()
+    }
+
+    pub(crate) fn apply(&mut self, blobs: Vec<Vec<u8>>) -> Result<(), NoteError> {
+        let mut changes = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            changes.push(Change::from_bytes(blob)?);
+        }
+        self.doc.apply_changes(changes)?;
         Ok(())
     }
 
