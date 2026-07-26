@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 automerge = "0.10"
-postcard = { workspace = true }
+ciborium = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1.24.0", features = ["v4"] }

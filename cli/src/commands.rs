@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use atlas_core::{FileStore, Vault, VaultError};
 
 use crate::cli::{Cli, Command};
+use crate::relay_transport::RelayTransport;
 
 /// Runs the parsed CLI.
 ///
@@ -22,7 +23,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Show { note } => show(dir, &note),
         Command::Edit { note, body } => edit(dir, &note, body),
         Command::Rm { note } => remove(dir, &note),
-        Command::Sync { other } => sync(dir, &other),
+        Command::Merge { other } => merge(dir, &other),
+        Command::Sync { relay, graph } => sync(dir, &relay, &graph),
     }
 }
 
@@ -90,7 +92,7 @@ fn remove(dir: &Path, note: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync(dir: &Path, other_dir: &Path) -> Result<()> {
+fn merge(dir: &Path, other_dir: &Path) -> Result<()> {
     let mut vault = open(dir)?;
     let other = open(other_dir)?;
     let report = vault.merge_from(&other)?;
@@ -99,6 +101,17 @@ fn sync(dir: &Path, other_dir: &Path) -> Result<()> {
         other_dir.display(),
         report.merged,
         report.pulled
+    );
+    Ok(())
+}
+
+fn sync(dir: &Path, relay: &str, graph: &str) -> Result<()> {
+    let mut vault = open(dir)?;
+    let mut transport = RelayTransport::new(relay);
+    let outcome = vault.sync(graph, &mut transport)?;
+    println!(
+        "synced graph {graph}: pushed {}, pulled {}",
+        outcome.pushed, outcome.pulled
     );
     Ok(())
 }
