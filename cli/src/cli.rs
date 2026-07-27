@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 
 /// Command-line interface for `atlas`.
 ///
-/// Each vault is a directory; `sync` reconciles one vault with another.
+/// Each vault is a directory. `merge` reconciles two local vaults; `sync`
+/// exchanges changes with a relay.
 #[derive(Parser)]
 #[command(name = "atlas", version)]
 pub struct Cli {
@@ -55,9 +56,18 @@ pub enum Command {
         /// Note id, unique id prefix, or exact path.
         note: String,
     },
-    /// Pull another vault's changes into this one.
-    Sync {
+    /// Merge another local vault directory into this one.
+    Merge {
         /// The other vault's directory.
         other: PathBuf,
+    },
+    /// Sync with a relay: push local changes, pull remote ones.
+    Sync {
+        /// Relay base URL, e.g. <http://127.0.0.1:4000>.
+        #[arg(long)]
+        relay: String,
+        /// Shared graph name on the relay.
+        #[arg(long)]
+        graph: String,
     },
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "cli"]
+members = ["core", "cli", "relay"]
 resolver = "2"
 
 
@@ -31,3 +31,8 @@ await_holding_lock = "deny"
 large_futures = "deny"
 exit = "deny"
 mem_forget = "deny"
+
+[workspace.dependencies]
+ciborium = "0.2.2"
+thiserror = "2.0.19"
+serde = { version = "1", features = ["derive"] }

@@ -128,7 +128,7 @@ impl From<crate::NoteError> for SyncError {
     }
 }
 
-/// Per-graph sync progress, persisted in the vault's store as postcard.
+/// Per-graph sync progress, persisted in the vault's store as CBOR.
 #[derive(Default, Serialize, Deserialize)]
 struct SyncState {
     cursor: Option<Cursor>,
@@ -255,16 +255,16 @@ impl Vault {
 
     fn load_sync_state(&self, graph: &str) -> Result<SyncState, SyncError> {
         match self.store_get(&sync_key(graph))? {
-            Some(bytes) => {
-                postcard::from_bytes(&bytes).map_err(|e| SyncError::Malformed(e.to_string()))
-            }
+            Some(bytes) => ciborium::from_reader(bytes.as_slice())
+                .map_err(|e| SyncError::Malformed(e.to_string())),
             None => Ok(SyncState::default()),
         }
     }
 
     fn save_sync_state(&mut self, graph: &str, state: &SyncState) -> Result<(), SyncError> {
-        let bytes =
-            postcard::to_allocvec(state).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        let mut bytes = Vec::new();
+        ciborium::into_writer(state, &mut bytes)
+            .map_err(|e| SyncError::Malformed(e.to_string()))?;
         self.store_put(&sync_key(graph), bytes)?;
         Ok(())
     }
@@ -293,14 +293,14 @@ impl Envelope {
         }
     }
 
-    /// Encoding is done with postcard to minimize space overhead. Making the trade-off
-    /// versus standardized CBOR as inspecting the payload is useless anyway (ciphertext).
     fn encode(&self) -> Result<Vec<u8>, SyncError> {
-        postcard::to_allocvec(self).map_err(|e| SyncError::Malformed(e.to_string()))
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        Ok(buf)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, SyncError> {
-        postcard::from_bytes(bytes).map_err(|e| SyncError::Malformed(e.to_string()))
+        ciborium::from_reader(bytes).map_err(|e| SyncError::Malformed(e.to_string()))
     }
 }
 
