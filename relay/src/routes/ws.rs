@@ -54,8 +54,24 @@ async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
                     break;
                 }
             }
-            update = updates.recv() => {
-                if forward(update, &mut socket, &graph, &store, &mut head).await.is_break() {
+            batch = updates.recv() => {
+                let sent = match batch {
+                    // Delivered in order with no gaps, so this batch starts at head.
+                    Ok(changes) => {
+                        head += u64::try_from(changes.len()).unwrap_or(0);
+                        send_sync(&mut socket, changes, head).await
+                    }
+                    // Fell behind the ring: re-subscribe and re-read atomically,
+                    // dropping the stale buffer and realigning head to the log.
+                    Err(RecvError::Lagged(_)) => {
+                        let (fresh, missed, new_head) = store.subscribe_and_read(&graph, head);
+                        updates = fresh;
+                        head = new_head;
+                        send_sync(&mut socket, missed, head).await
+                    }
+                    Err(RecvError::Closed) => break,
+                };
+                if sent.is_err() {
                     break;
                 }
             }
@@ -94,33 +110,6 @@ fn handle_incoming(
         None | Some(Err(_) | Ok(Message::Close(_))) => ControlFlow::Break(()),
         Some(Ok(_)) => ControlFlow::Continue(()),
     }
-}
-
-async fn forward(
-    batch: Result<Vec<Vec<u8>>, RecvError>,
-    socket: &mut WebSocket,
-    graph: &str,
-    store: &MemStore,
-    head: &mut u64,
-) -> ControlFlow<()> {
-    let changes = match batch {
-        // Delivered in order with no gaps, so this batch starts at `head`.
-        Ok(changes) => {
-            *head += u64::try_from(changes.len()).unwrap_or(0);
-            changes
-        }
-        // Fell behind the fan-out ring; re-read the missed tail from the log.
-        Err(RecvError::Lagged(_)) => {
-            let (missed, new_head) = store.read_from(graph, *head);
-            *head = new_head;
-            missed
-        }
-        Err(RecvError::Closed) => return ControlFlow::Break(()),
-    };
-    if send_sync(socket, changes, *head).await.is_err() {
-        return ControlFlow::Break(());
-    }
-    ControlFlow::Continue(())
 }
 
 async fn send_sync(

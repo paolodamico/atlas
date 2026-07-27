@@ -10,7 +10,6 @@ use atlas_core::{FileStore, NoteError, NoteSummary, Vault, VaultError};
 use tokio::sync::broadcast;
 
 const EVENT_QUEUE: usize = 64;
-const LIST_LIMIT: usize = 10_000;
 
 /// A state change for the host to render. Carries the new state so callers
 /// never have to re-query.
@@ -118,7 +117,7 @@ impl Client {
     /// Lists all notes.
     #[must_use]
     pub fn list_notes(&self) -> Vec<NoteSummary> {
-        self.lock().list_notes(0, LIST_LIMIT)
+        self.lock().list_notes(0, usize::MAX)
     }
 
     /// Returns a note's current body.
@@ -142,6 +141,6 @@ impl Client {
     fn emit_notes(&self, vault: &Vault) {
         let _ = self
             .events
-            .send(Event::Notes(vault.list_notes(0, LIST_LIMIT)));
+            .send(Event::Notes(vault.list_notes(0, usize::MAX)));
     }
 }

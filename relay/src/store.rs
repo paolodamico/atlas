@@ -83,15 +83,6 @@ impl MemStore {
             .append(blobs);
     }
 
-    /// Returns `graph`'s blobs at or after `from`, with the current head.
-    #[must_use]
-    pub fn read_from(&self, graph: &str, from: u64) -> (Changes, u64) {
-        let graphs = self.lock();
-        graphs
-            .get(graph)
-            .map_or_else(|| (Vec::new(), 0), |log| (log.read_from(from), log.head()))
-    }
-
     /// Subscribes to `graph`'s live updates and reads catch-up from `from`,
     /// both under one lock. Subscribing and reading atomically means the
     /// subscriber receives exactly the blobs appended after `head`, contiguous

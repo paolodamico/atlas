@@ -78,6 +78,29 @@ pub struct SyncOutcome {
     pub pulled: usize,
 }
 
+/// What a [`Vault::apply_remote`] changed, so a caller can react (e.g. re-render).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Note ids whose body changed.
+    pub notes: Vec<String>,
+    /// Whether the note list (metadata) changed.
+    pub list_changed: bool,
+}
+
+impl Applied {
+    fn from_touched(touched: Vec<String>) -> Self {
+        let mut applied = Self::default();
+        for id in touched {
+            if id == ROOT_DOC {
+                applied.list_changed = true;
+            } else {
+                applied.notes.push(id);
+            }
+        }
+        applied
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("decryption failed: {0}")]
 struct CipherError(String);
@@ -192,6 +215,46 @@ impl Vault {
         Ok(SyncOutcome { pushed, pulled })
     }
 
+    /// The persisted cursor for `graph`, or `None` if it has never synced.
+    /// Used to say hello to a relay on connect.
+    ///
+    /// # Errors
+    /// Returns an error if the stored sync state is unreadable.
+    pub fn sync_cursor(&self, graph: &str) -> Result<Option<Cursor>, SyncError> {
+        Ok(self.load_sync_state(graph)?.cursor)
+    }
+
+    /// Collects local changes not yet pushed for `graph`, as opaque blobs to
+    /// hand a relay. Does not advance sync state: [`Vault::apply_remote`] marks
+    /// them pushed when the relay echoes them back.
+    ///
+    /// # Errors
+    /// Returns an error if a store or automerge operation fails.
+    pub fn collect_outgoing(&mut self, graph: &str) -> Result<Vec<Vec<u8>>, SyncError> {
+        let state = self.load_sync_state(graph)?;
+        self.gather_outgoing(&state, &NoCipher)
+    }
+
+    /// Applies change blobs pulled from a relay and advances `graph`'s cursor,
+    /// persisting the vault and sync state. Returns what changed.
+    ///
+    /// # Errors
+    /// Returns an error if a blob is malformed or a store/automerge op fails.
+    pub fn apply_remote(
+        &mut self,
+        graph: &str,
+        changes: Vec<Vec<u8>>,
+        cursor: Cursor,
+    ) -> Result<Applied, SyncError> {
+        let mut state = self.load_sync_state(graph)?;
+        let touched = self.apply_incoming(changes, &NoCipher)?;
+        self.persist()?;
+        state.cursor = Some(cursor);
+        self.refresh_pushed_heads(&mut state)?;
+        self.save_sync_state(graph, &state)?;
+        Ok(Applied::from_touched(touched))
+    }
+
     fn gather_outgoing(
         &mut self,
         state: &SyncState,
@@ -214,16 +277,18 @@ impl Vault {
         Ok(out)
     }
 
+    /// Decrypts and applies `blobs`, returning the doc ids it touched.
     fn apply_incoming(
         &mut self,
         blobs: Vec<Vec<u8>>,
         cipher: &impl Cipher,
-    ) -> Result<(), SyncError> {
+    ) -> Result<Vec<String>, SyncError> {
         let mut by_doc: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         for blob in blobs {
             let env = Envelope::decode(&cipher.decrypt(blob)?)?;
             by_doc.entry(env.doc_id).or_default().push(env.change);
         }
+        let touched: Vec<String> = by_doc.keys().cloned().collect();
         for (doc_id, changes) in by_doc {
             if doc_id == ROOT_DOC {
                 self.root_apply(changes)?;
@@ -236,7 +301,7 @@ impl Vault {
             note.apply(changes)?;
             self.store_put(&doc_id, note.to_bytes())?;
         }
-        Ok(())
+        Ok(touched)
     }
 
     fn refresh_pushed_heads(&mut self, state: &mut SyncState) -> Result<(), SyncError> {
@@ -418,6 +483,27 @@ mod tests {
         assert!(matches!(result, Err(SyncError::Snapshot)));
         // The cursor was not advanced, so a retry still starts from scratch.
         assert!(a.load_sync_state("g").unwrap().cursor.is_none());
+    }
+
+    #[test]
+    fn collect_outgoing_and_apply_remote_converge() {
+        // Simulate the websocket flow: A collects its changes, a relay assigns
+        // a cursor, B applies them via apply_remote.
+        let mut a = vault();
+        let (id, _) = a.create_note("n.md", "N", "hello").unwrap();
+        let outgoing = a.collect_outgoing("g").unwrap();
+        let cursor = Cursor {
+            epoch: 0,
+            seq: outgoing.len() as u64,
+        };
+
+        let mut b = vault();
+        let applied = b.apply_remote("g", outgoing, cursor).unwrap();
+
+        assert!(applied.list_changed);
+        assert_eq!(applied.notes, vec![id.clone()]);
+        assert_eq!(b.get_note(&id).unwrap().body().unwrap(), "hello");
+        assert_eq!(b.sync_cursor("g").unwrap(), Some(cursor));
     }
 
     #[test]
