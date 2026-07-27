@@ -47,15 +47,11 @@ pub(super) async fn handler(
     let request: SyncRequest =
         ciborium::from_reader(body.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let pushed = request.changes.len();
-    store.append(&graph, request.changes);
-
     let from = request.since.map_or(0, |c| c.seq);
+    let (changes, seq) = store.append_and_read(&graph, request.changes, from);
     let response = SyncResponse {
-        changes: store.read_from(&graph, from),
-        cursor: Cursor {
-            epoch: 0,
-            seq: store.head(&graph),
-        },
+        changes,
+        cursor: Cursor { epoch: 0, seq },
         snapshot: None,
     };
     tracing::info!(pushed, pulled = response.changes.len(), "synced graph");
