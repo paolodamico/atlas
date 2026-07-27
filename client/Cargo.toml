@@ -1,0 +1,18 @@
+[package]
+name = "atlas-client"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+atlas-core = { path = "../core" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

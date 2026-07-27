@@ -86,6 +86,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-client"
+version = "0.0.1"
+dependencies = [
+ "atlas-core",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "atlas-core"
 version = "0.0.1"
 dependencies = [

@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "cli", "relay"]
+members = ["core", "cli", "relay", "client"]
 resolver = "2"
 
 
@@ -36,3 +36,4 @@ mem_forget = "deny"
 ciborium = "0.2.2"
 thiserror = "2.0.19"
 serde = { version = "1", features = ["derive"] }
+tokio = "1.53.1"
