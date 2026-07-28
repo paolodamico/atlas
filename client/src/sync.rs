@@ -2,8 +2,10 @@
 //! local ones, reconnecting with backoff. It feeds the same event stream as
 //! local edits, so the host renders remote and local changes identically.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atlas_core::{Cursor, Vault};
 use futures_util::{SinkExt, StreamExt};
@@ -20,6 +22,15 @@ use crate::{Event, SyncStatus, emit_applied, guard};
 const PUSH_INTERVAL: Duration = Duration::from_millis(200);
 const BACKOFF_START: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// A session must stay up this long before we treat it as healthy and reset the
+/// backoff. Otherwise a relay that accepts then immediately drops the socket
+/// would be retried several times a second forever.
+const HEALTHY_SESSION: Duration = Duration::from_secs(5);
+/// Drop a connection that has produced no frame (not even a server ping) within
+/// this window. MUST exceed the relay's ping interval.
+const READ_TIMEOUT: Duration = Duration::from_secs(40);
+/// How often to check the read timeout.
+const LIVENESS_CHECK: Duration = Duration::from_secs(10);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -35,15 +46,40 @@ struct ServerMsg {
     cursor: Cursor,
 }
 
-/// The websocket is finished; the caller should back off and reconnect.
-#[derive(Debug, thiserror::Error)]
-enum Disconnected {
-    #[error("encoding message: {0}")]
-    Encode(String),
-    #[error("applying remote changes: {0}")]
-    Apply(String),
-    #[error("websocket: {0}")]
-    Socket(#[from] tungstenite::Error),
+/// The connection target.
+struct Target {
+    /// The websocket URL to dial.
+    ws_url: String,
+    /// The sync-state key: scoped by relay so pointing a graph at a different
+    /// relay does not reuse stale cursor/pushed state.
+    scope: String,
+}
+
+impl Target {
+    /// Builds the relay target URL
+    fn parse(base: &str, graph: &str) -> Option<Self> {
+        let base = base.trim_end_matches('/');
+        if base.is_empty()
+            || graph.is_empty()
+            || graph.chars().all(|c| {
+                !c.is_control() && !c.is_whitespace() && !matches!(c, '/' | '?' | '#' | '%')
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            ws_url: format!("{base}/graphs/{graph}/ws"),
+            scope: format!("{}-{graph}", relay_tag(base)),
+        })
+    }
+}
+
+/// A short, filesystem-safe token for a relay URL, used to scope persisted sync
+/// progress to the relay. Only needs to be stable within one device's lifetime.
+fn relay_tag(base: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Drives background sync for one graph: owns the shared context and reconnects
@@ -69,15 +105,25 @@ impl Syncer {
 
     /// Connects, runs a session until the socket drops, then backs off and
     /// retries. Reports connection state as [`Event::Status`].
+    ///
+    /// The backoff is reset only after a session stays up long enough to be
+    /// healthy, so a relay that flaps (accepts then immediately closes) is
+    /// backed off instead of hammered.
     pub(crate) async fn run(self, url: String) {
-        let ws_url = format!("{url}/graphs/{}/ws", self.graph);
+        let Some(target) = Target::parse(&url, &self.graph) else {
+            self.set_status(SyncStatus::Offline);
+            return;
+        };
         let mut backoff = BACKOFF_START;
         loop {
             self.set_status(SyncStatus::Connecting);
-            if let Ok((socket, _)) = connect_async(ws_url.as_str()).await {
-                backoff = BACKOFF_START;
+            if let Ok((socket, _)) = connect_async(target.ws_url.as_str()).await {
                 self.set_status(SyncStatus::Live);
-                let _ = self.session(socket).await;
+                let started = Instant::now();
+                let _ = self.session(socket, &target.scope).await;
+                if started.elapsed() >= HEALTHY_SESSION {
+                    backoff = BACKOFF_START;
+                }
             }
             self.set_status(SyncStatus::Offline);
             sleep(backoff).await;
@@ -85,24 +131,37 @@ impl Syncer {
         }
     }
 
-    /// Greets the relay with the local cursor, then continuously pushes
-    /// incoming batches and periodic pushes until the socket drops.
-    async fn session(&self, mut socket: Socket) -> Result<(), Disconnected> {
-        let Ok(since) = guard(&self.vault).sync_cursor(&self.graph) else {
+    /// Greets the relay with the local cursor, then continuously applies
+    /// incoming batches and pushes local changes until the socket drops or goes
+    /// silent past [`READ_TIMEOUT`].
+    async fn session(&self, mut socket: Socket, scope: &str) -> Result<(), Disconnected> {
+        let Ok(since) = guard(&self.vault).sync_cursor(scope) else {
             return Ok(());
         };
         self.send(&mut socket, &ClientMsg::Hello { since }).await?;
 
         let mut push = interval(PUSH_INTERVAL);
+        let mut liveness = interval(LIVENESS_CHECK);
+        let mut in_flight: HashSet<Vec<u8>> = HashSet::new();
+        let mut last_seen = Instant::now();
         loop {
             tokio::select! {
                 incoming = socket.next() => match incoming {
-                    Some(Ok(Message::Binary(bytes))) => self.apply(&bytes)?,
+                    Some(Ok(Message::Binary(bytes))) => {
+                        last_seen = Instant::now();
+                        self.apply(scope, &bytes, &mut in_flight)?;
+                    }
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Err(e)) => return Err(e.into()),
-                    Some(Ok(_)) => {}
+                    // Pings, pongs, and other frames still prove the peer is alive.
+                    Some(Ok(_)) => last_seen = Instant::now(),
                 },
-                _ = push.tick() => self.push(&mut socket).await?,
+                _ = push.tick() => self.push(&mut socket, scope, &mut in_flight).await?,
+                _ = liveness.tick() => {
+                    if last_seen.elapsed() >= READ_TIMEOUT {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -110,26 +169,50 @@ impl Syncer {
     /// Applies one remote batch and emits events for what changed. A malformed
     /// frame is skipped, but a failed apply is surfaced so the session drops and
     /// reconnects from the unchanged cursor rather than skipping those changes.
-    fn apply(&self, bytes: &[u8]) -> Result<(), Disconnected> {
+    ///
+    /// Echoed blobs are cleared from `in_flight` first: the relay has now
+    /// acknowledged them, so they are no longer pending a resend.
+    fn apply(
+        &self,
+        scope: &str,
+        bytes: &[u8],
+        in_flight: &mut HashSet<Vec<u8>>,
+    ) -> Result<(), Disconnected> {
         let Ok(ServerMsg { changes, cursor }) = ciborium::from_reader(bytes) else {
             return Ok(());
         };
+        for blob in &changes {
+            in_flight.remove(blob);
+        }
         let applied = guard(&self.vault)
-            .apply_remote(&self.graph, changes, cursor)
+            .apply_remote(scope, changes, cursor)
             .map_err(|e| Disconnected::Apply(e.to_string()))?;
         emit_applied(&self.vault, &self.events, &applied);
         Ok(())
     }
 
-    /// Sends any local changes not yet pushed to the relay.
-    async fn push(&self, socket: &mut Socket) -> Result<(), Disconnected> {
-        let Ok(changes) = guard(&self.vault).collect_outgoing(&self.graph) else {
+    /// Sends local changes not yet pushed, skipping any already in flight (sent
+    /// but not yet echoed) so a slow echo does not make us resend duplicates.
+    async fn push(
+        &self,
+        socket: &mut Socket,
+        scope: &str,
+        in_flight: &mut HashSet<Vec<u8>>,
+    ) -> Result<(), Disconnected> {
+        let Ok(changes) = guard(&self.vault).collect_outgoing(scope) else {
             return Ok(());
         };
-        if changes.is_empty() {
+        let fresh: Vec<Vec<u8>> = changes
+            .into_iter()
+            .filter(|blob| !in_flight.contains(blob))
+            .collect();
+        if fresh.is_empty() {
             return Ok(());
         }
-        self.send(socket, &ClientMsg::Push { changes }).await
+        for blob in &fresh {
+            in_flight.insert(blob.clone());
+        }
+        self.send(socket, &ClientMsg::Push { changes: fresh }).await
     }
 
     async fn send(&self, socket: &mut Socket, msg: &ClientMsg) -> Result<(), Disconnected> {
@@ -141,5 +224,64 @@ impl Syncer {
 
     fn set_status(&self, status: SyncStatus) {
         let _ = self.events.send(Event::Status(status));
+    }
+}
+
+/// The websocket is finished; the caller should back off and reconnect.
+#[derive(Debug, thiserror::Error)]
+enum Disconnected {
+    #[error("encoding message: {0}")]
+    Encode(String),
+    #[error("applying remote changes: {0}")]
+    Apply(String),
+    #[error("websocket: {0}")]
+    Socket(#[from] tungstenite::Error),
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
+mod tests {
+    use super::{Target, relay_tag, valid_graph};
+
+    #[test]
+    fn trailing_slash_in_base_url_is_normalized() {
+        let target = Target::parse("ws://host:4000/", "g").unwrap();
+        assert_eq!(target.ws_url, "ws://host:4000/graphs/g/ws");
+    }
+
+    #[test]
+    fn graph_names_that_would_corrupt_the_path_are_rejected() {
+        assert!(Target::parse("ws://host", "").is_none());
+        for bad in ["a/b", "a?b", "a#b", "a%20b", "a b", "a\tb", "a\u{0}b"] {
+            assert!(!valid_graph(bad), "{bad:?} should be rejected");
+            assert!(Target::parse("ws://host", bad).is_none());
+        }
+    }
+
+    #[test]
+    fn empty_base_url_is_rejected() {
+        assert!(Target::parse("", "g").is_none());
+        assert!(Target::parse("/", "g").is_none());
+    }
+
+    #[test]
+    fn scope_tracks_the_relay_not_just_the_graph() {
+        let one = Target::parse("ws://host-a:4000", "g").unwrap();
+        let two = Target::parse("ws://host-b:4000", "g").unwrap();
+        assert_ne!(
+            one.scope, two.scope,
+            "different relays must not share state"
+        );
+        assert!(one.scope.ends_with("-g"));
+    }
+
+    #[test]
+    fn relay_tag_is_stable_and_filesystem_safe() {
+        assert_eq!(relay_tag("ws://host:4000"), relay_tag("ws://host:4000"));
+        assert!(
+            relay_tag("ws://host:4000/a/b")
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 }
