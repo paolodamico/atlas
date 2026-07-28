@@ -25,6 +25,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Rm { note } => remove(dir, &note),
         Command::Merge { other } => merge(dir, &other),
         Command::Sync { relay, graph } => sync(dir, &relay, &graph),
+        Command::Live { note, relay, graph } => crate::live::run(dir, &note, &relay, &graph),
     }
 }
 

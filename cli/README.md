@@ -3,7 +3,7 @@
 A command-line client over `atlas-core`, and the vehicle for the offline-sync
 demo. Each vault is a directory (`--vault <dir>`, default `atlas-vault`).
 
-## Notes
+## 📔 Notes
 
 - Notes are addressed by id, a unique id prefix (as shown by `list`), or exact
   path.
@@ -11,18 +11,41 @@ demo. Each vault is a directory (`--vault <dir>`, default `atlas-vault`).
 - `sync --relay <url> --graph <name>` exchanges incremental changes with a
   relay: it pushes local changes and pulls remote ones. Run it from each
   device sharing a graph to keep them converged.
+- `live <note> --relay <ws-url> --graph <name>` is a long-running editor: it
+  renders remote changes live over a websocket and appends each line you type.
 
-## Walkthrough: concurrent offline edits merge through a relay
+## 🦮 Walkthroughs
 
-Start a relay (defaults to `127.0.0.1:4000`):
+### Live two-terminal demo
+
+Start a relay (`cargo run -p atlas-relay`), then create and share a note:
 
 ```sh
-cargo run -p relay
+atlas --vault ./alpha init && atlas --vault ./beta init
+atlas --vault ./alpha add n.md --title Note --body "start"
+atlas --vault ./alpha sync --relay http://127.0.0.1:4000 --graph demo
+atlas --vault ./beta sync --relay http://127.0.0.1:4000 --graph demo
 ```
 
-Then, with `URL=http://127.0.0.1:4000`:
+Then open the same note live in two terminals:
 
 ```sh
+# terminal A
+atlas --vault ./alpha live n.md --relay ws://127.0.0.1:4000 --graph demo
+# terminal B
+atlas --vault ./beta live n.md --relay ws://127.0.0.1:4000 --graph demo
+```
+
+Type a line in either terminal and it appears in the other within a moment;
+concurrent edits merge with no loss.
+
+### Concurrent offline edits merge through a relay
+
+Start a relay (`cargo run -p atlas-relay`) and run:
+
+```sh
+URL=http://127.0.0.1:4000
+
 atlas --vault ./alpha init
 atlas --vault ./beta init
 

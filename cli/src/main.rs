@@ -6,6 +6,7 @@
 
 mod cli;
 mod commands;
+mod live;
 mod relay_transport;
 
 use anyhow::Result;

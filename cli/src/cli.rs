@@ -70,4 +70,16 @@ pub enum Command {
         #[arg(long)]
         graph: String,
     },
+    /// Watch a note and read/write live through a relay: renders remote changes as they arrive,
+    /// and appends each line you type. Run it in two terminals to see it merge.
+    Live {
+        /// Note id, unique id prefix, or exact path.
+        note: String,
+        /// Relay websocket base URL, e.g. <ws://127.0.0.1:4000>.
+        #[arg(long)]
+        relay: String,
+        /// Shared graph name on the relay.
+        #[arg(long)]
+        graph: String,
+    },
 }
