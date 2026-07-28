@@ -5,15 +5,22 @@
 //! then each batch fanned out from the graph as clients push. Frames are CBOR.
 
 use std::ops::ControlFlow;
+use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Path};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::interval;
 
 use super::sync::Cursor;
 use crate::store::MemStore;
+
+/// How often the relay pings idle peers. Keeps NAT/proxy paths warm and lets a
+/// dead half-open connection surface as a failed send.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 enum ClientMsg {
@@ -47,10 +54,17 @@ async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
         return;
     }
 
+    let mut ping = interval(PING_INTERVAL);
+    ping.tick().await;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
                 if handle_incoming(incoming, &graph, &store).is_break() {
+                    break;
+                }
+            }
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
                     break;
                 }
             }
