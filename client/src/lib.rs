@@ -99,12 +99,8 @@ impl Client {
     ///
     /// Must be called from within a tokio runtime.
     pub fn connect(&self, url: impl Into<String>, graph: impl Into<String>) {
-        tokio::spawn(sync::run(
-            Arc::clone(&self.vault),
-            self.events.clone(),
-            url.into(),
-            graph.into(),
-        ));
+        let syncer = sync::Syncer::new(Arc::clone(&self.vault), self.events.clone(), graph.into());
+        tokio::spawn(syncer.run(url.into()));
     }
 
     /// Creates a note, returning its id.

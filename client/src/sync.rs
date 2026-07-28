@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::{Event, SyncStatus, emit_applied, guard};
@@ -35,93 +35,107 @@ struct ServerMsg {
     cursor: Cursor,
 }
 
-pub(crate) async fn run(
+/// The websocket is finished; the caller should back off and reconnect.
+#[derive(Debug, thiserror::Error)]
+enum Disconnected {
+    #[error("encoding message: {0}")]
+    Encode(String),
+    #[error("websocket: {0}")]
+    Socket(#[from] tungstenite::Error),
+}
+
+/// Drives background sync for one graph: owns the shared context and reconnects
+/// forever, running a session per connection.
+pub(crate) struct Syncer {
     vault: Arc<Mutex<Vault>>,
     events: broadcast::Sender<Event>,
-    url: String,
     graph: String,
-) {
-    let ws_url = format!("{url}/graphs/{graph}/ws");
-    let mut backoff = BACKOFF_START;
-    loop {
-        set_status(&events, SyncStatus::Connecting);
-        if let Ok((socket, _)) = connect_async(ws_url.as_str()).await {
-            backoff = BACKOFF_START;
-            set_status(&events, SyncStatus::Live);
-            session(socket, &vault, &events, &graph).await;
-        }
-        set_status(&events, SyncStatus::Offline);
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
-    }
 }
 
-async fn session(
-    mut socket: Socket,
-    vault: &Mutex<Vault>,
-    events: &broadcast::Sender<Event>,
-    graph: &str,
-) {
-    let Ok(cursor) = guard(vault).sync_cursor(graph) else {
-        return;
-    };
-    if send(&mut socket, &ClientMsg::Hello { since: cursor })
-        .await
-        .is_err()
-    {
-        return;
+impl Syncer {
+    pub(crate) fn new(
+        vault: Arc<Mutex<Vault>>,
+        events: broadcast::Sender<Event>,
+        graph: String,
+    ) -> Self {
+        Self {
+            vault,
+            events,
+            graph,
+        }
     }
 
-    let mut push = interval(PUSH_INTERVAL);
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                match incoming {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        if let Ok(msg) = decode(&bytes) {
-                            apply(vault, events, graph, msg);
-                        }
-                    }
-                    None | Some(Err(_) | Ok(Message::Close(_))) => return,
+    /// Connects, runs a session until the socket drops, then backs off and
+    /// retries. Reports connection state as [`Event::Status`].
+    pub(crate) async fn run(self, url: String) {
+        let ws_url = format!("{url}/graphs/{}/ws", self.graph);
+        let mut backoff = BACKOFF_START;
+        loop {
+            self.set_status(SyncStatus::Connecting);
+            if let Ok((socket, _)) = connect_async(ws_url.as_str()).await {
+                backoff = BACKOFF_START;
+                self.set_status(SyncStatus::Live);
+                let _ = self.session(socket).await;
+            }
+            self.set_status(SyncStatus::Offline);
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
+    }
+
+    /// Greets the relay with the local cursor, then continuously pushes
+    /// incoming batches and periodic pushes until the socket drops.
+    async fn session(&self, mut socket: Socket) -> Result<(), Disconnected> {
+        let Ok(since) = guard(&self.vault).sync_cursor(&self.graph) else {
+            return Ok(());
+        };
+        self.send(&mut socket, &ClientMsg::Hello { since }).await?;
+
+        let mut push = interval(PUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                incoming = socket.next() => match incoming {
+                    Some(Ok(Message::Binary(bytes))) => self.apply(&bytes),
+                    Some(Ok(Message::Close(_))) | None => return Ok(()),
+                    Some(Err(e)) => return Err(e.into()),
                     Some(Ok(_)) => {}
-                }
-            }
-            _ = push.tick() => {
-                if push_local(&mut socket, vault, graph).await.is_err() {
-                    return;
-                }
+                },
+                _ = push.tick() => self.push(&mut socket).await?,
             }
         }
     }
-}
 
-fn apply(vault: &Mutex<Vault>, events: &broadcast::Sender<Event>, graph: &str, msg: ServerMsg) {
-    let Ok(applied) = guard(vault).apply_remote(graph, msg.changes, msg.cursor) else {
-        return;
-    };
-    emit_applied(vault, events, &applied);
-}
-
-async fn push_local(socket: &mut Socket, vault: &Mutex<Vault>, graph: &str) -> Result<(), ()> {
-    let Ok(outgoing) = guard(vault).collect_outgoing(graph) else {
-        return Ok(());
-    };
-    if outgoing.is_empty() {
-        return Ok(());
+    /// Applies one remote batch and emits events for what changed. A malformed
+    /// or unapplicable frame is skipped without dropping the connection.
+    fn apply(&self, bytes: &[u8]) {
+        let Ok(ServerMsg { changes, cursor }) = ciborium::from_reader(bytes) else {
+            return;
+        };
+        let Ok(applied) = guard(&self.vault).apply_remote(&self.graph, changes, cursor) else {
+            return;
+        };
+        emit_applied(&self.vault, &self.events, &applied);
     }
-    send(socket, &ClientMsg::Push { changes: outgoing }).await
-}
 
-async fn send(socket: &mut Socket, msg: &ClientMsg) -> Result<(), ()> {
-    let mut body = Vec::new();
-    ciborium::into_writer(msg, &mut body).map_err(|_| ())?;
-    socket.send(Message::binary(body)).await.map_err(|_| ())
-}
+    /// Sends any local changes not yet pushed to the relay.
+    async fn push(&self, socket: &mut Socket) -> Result<(), Disconnected> {
+        let Ok(changes) = guard(&self.vault).collect_outgoing(&self.graph) else {
+            return Ok(());
+        };
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.send(socket, &ClientMsg::Push { changes }).await
+    }
 
-fn decode(bytes: &[u8]) -> Result<ServerMsg, ()> {
-    ciborium::from_reader(bytes).map_err(|_| ())
-}
+    async fn send(&self, socket: &mut Socket, msg: &ClientMsg) -> Result<(), Disconnected> {
+        let mut body = Vec::new();
+        ciborium::into_writer(msg, &mut body).map_err(|e| Disconnected::Encode(e.to_string()))?;
+        socket.send(Message::binary(body)).await?;
+        Ok(())
+    }
 
-fn set_status(events: &broadcast::Sender<Event>, status: SyncStatus) {
-    let _ = events.send(Event::Status(status));
+    fn set_status(&self, status: SyncStatus) {
+        let _ = self.events.send(Event::Status(status));
+    }
 }

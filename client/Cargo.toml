@@ -11,8 +11,14 @@ workspace = true
 
 [dependencies]
 atlas-core = { path = "../core" }
+ciborium = { workspace = true }
+futures-util = "0.3.33"
+serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "net", "time", "macros"] }
+tokio-tungstenite = "0.30.0"
 
 [dev-dependencies]
+atlas-relay = { path = "../relay" }
+axum = { version = "0.8.9", features = ["ws"] }
 tempfile = "3.27.0"

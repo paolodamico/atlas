@@ -78,10 +78,12 @@ name = "atlas-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "atlas-client",
  "atlas-core",
  "ciborium",
  "clap",
  "serde",
+ "tokio",
  "ureq",
 ]
 
@@ -90,9 +92,15 @@ name = "atlas-client"
 version = "0.0.1"
 dependencies = [
  "atlas-core",
+ "atlas-relay",
+ "axum",
+ "ciborium",
+ "futures-util",
+ "serde",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]
