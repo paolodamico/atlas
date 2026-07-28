@@ -6,10 +6,11 @@
 mod sync;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use atlas_core::{Applied, FileStore, NoteError, NoteSummary, Vault, VaultError};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 const EVENT_QUEUE: usize = 64;
 
@@ -71,6 +72,20 @@ impl From<NoteError> for ClientError {
 pub struct Client {
     vault: Arc<Mutex<Vault>>,
     events: broadcast::Sender<Event>,
+    sync_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .sync_task
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl Client {
@@ -84,6 +99,7 @@ impl Client {
         Ok(Self {
             vault: Arc::new(Mutex::new(vault)),
             events,
+            sync_task: Mutex::new(None),
         })
     }
 
@@ -97,10 +113,21 @@ impl Client {
     /// Remote changes flow into the same event stream as local edits, and local
     /// edits are pushed. Reconnects with backoff; status is reported as events.
     ///
+    /// A prior sync task (from an earlier `connect`) is cancelled, and the task
+    /// is cancelled when the `Client` is dropped, so it never outlives its owner.
+    ///
     /// Must be called from within a tokio runtime.
     pub fn connect(&self, url: impl Into<String>, graph: impl Into<String>) {
         let syncer = sync::Syncer::new(Arc::clone(&self.vault), self.events.clone(), graph.into());
-        tokio::spawn(syncer.run(url.into()));
+        let task = tokio::spawn(syncer.run(url.into()));
+        if let Some(previous) = self
+            .sync_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(task)
+        {
+            previous.abort();
+        }
     }
 
     /// Creates a note, returning its id.

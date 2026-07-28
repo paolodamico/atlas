@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use atlas_client::{Client, Event};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast::Receiver;
@@ -48,30 +48,35 @@ async fn session(dir: &Path, note: &str, relay: &str, graph: &str) -> Result<()>
     Ok(())
 }
 
-/// Resolves `token` (id, id prefix, or path) to a note id, waiting briefly for
-/// it to arrive over the relay if it is not present yet.
+/// Resolves `token` (id, id prefix, or path) to exactly one note id, erroring if
+/// it is ambiguous and waiting briefly for the note to arrive over the relay if
+/// it is not present yet.
 async fn resolve(client: &Client, events: &mut Receiver<Event>, token: &str) -> Result<String> {
-    if let Some(id) = find(client, token) {
+    if let Some(id) = unique(client, token)? {
         return Ok(id);
     }
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let _ = events.recv().await;
-            if let Some(id) = find(client, token) {
-                return id;
+            if let Some(id) = unique(client, token)? {
+                return Ok(id);
             }
         }
     })
     .await
-    .map_err(|_| anyhow!("note '{token}' not found on this graph"))
+    .map_err(|_| anyhow!("note '{token}' not found on this graph"))?
 }
 
-fn find(client: &Client, token: &str) -> Option<String> {
-    client
-        .list_notes()
-        .into_iter()
-        .find(|n| n.id.starts_with(token) || n.path == token)
-        .map(|n| n.id)
+/// The single note matching `token`, `None` if none match yet (the note may
+/// still be arriving over the relay), or an error if more than one matches (as
+/// the other CLI commands do).
+fn unique(client: &Client, token: &str) -> Result<Option<String>> {
+    let mut ids = crate::commands::matching_ids(&client.list_notes(), token);
+    match ids.len() {
+        0 => Ok(None),
+        1 => Ok(Some(ids.remove(0))),
+        n => bail!("'{token}' is ambiguous ({n} matches)"),
+    }
 }
 
 fn append(client: &Client, id: &str, text: &str) -> Result<()> {

@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use atlas_core::{FileStore, Vault, VaultError};
+use atlas_core::{FileStore, NoteSummary, Vault, VaultError};
 
 use crate::cli::{Cli, Command};
 use crate::relay_transport::RelayTransport;
@@ -131,15 +131,19 @@ fn open(dir: &Path) -> Result<Vault> {
     }
 }
 
+/// Note ids whose id-prefix or exact path matches `token`. Shared with the
+/// `live` command so both selectors match identically.
+pub(crate) fn matching_ids(notes: &[NoteSummary], token: &str) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|n| n.id.starts_with(token) || n.path == token)
+        .map(|n| n.id.clone())
+        .collect()
+}
+
 /// Resolves a token (note id, unique id prefix, or exact path) to one id.
 fn resolve(vault: &Vault, token: &str) -> Result<String> {
-    let matches: Vec<String> = vault
-        .list_notes(0, 100_000)
-        .into_iter()
-        .filter(|n| n.id.starts_with(token) || n.path == token)
-        .map(|n| n.id)
-        .collect();
-    match matches.as_slice() {
+    match matching_ids(&vault.list_notes(0, usize::MAX), token).as_slice() {
         [only] => Ok(only.clone()),
         [] => bail!("no note matching '{token}'"),
         many => bail!("'{token}' is ambiguous ({} matches)", many.len()),

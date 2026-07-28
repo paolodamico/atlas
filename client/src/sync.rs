@@ -40,6 +40,8 @@ struct ServerMsg {
 enum Disconnected {
     #[error("encoding message: {0}")]
     Encode(String),
+    #[error("applying remote changes: {0}")]
+    Apply(String),
     #[error("websocket: {0}")]
     Socket(#[from] tungstenite::Error),
 }
@@ -95,7 +97,7 @@ impl Syncer {
         loop {
             tokio::select! {
                 incoming = socket.next() => match incoming {
-                    Some(Ok(Message::Binary(bytes))) => self.apply(&bytes),
+                    Some(Ok(Message::Binary(bytes))) => self.apply(&bytes)?,
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(_)) => {}
@@ -106,15 +108,17 @@ impl Syncer {
     }
 
     /// Applies one remote batch and emits events for what changed. A malformed
-    /// or unapplicable frame is skipped without dropping the connection.
-    fn apply(&self, bytes: &[u8]) {
+    /// frame is skipped, but a failed apply is surfaced so the session drops and
+    /// reconnects from the unchanged cursor rather than skipping those changes.
+    fn apply(&self, bytes: &[u8]) -> Result<(), Disconnected> {
         let Ok(ServerMsg { changes, cursor }) = ciborium::from_reader(bytes) else {
-            return;
+            return Ok(());
         };
-        let Ok(applied) = guard(&self.vault).apply_remote(&self.graph, changes, cursor) else {
-            return;
-        };
+        let applied = guard(&self.vault)
+            .apply_remote(&self.graph, changes, cursor)
+            .map_err(|e| Disconnected::Apply(e.to_string()))?;
         emit_applied(&self.vault, &self.events, &applied);
+        Ok(())
     }
 
     /// Sends any local changes not yet pushed to the relay.
