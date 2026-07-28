@@ -3,10 +3,12 @@
 //! Extends the core handling of atlas with network layer, websocket sync, state event streaming and
 //! foreign bindings.
 
+mod sync;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use atlas_core::{FileStore, NoteError, NoteSummary, Vault, VaultError};
+use atlas_core::{Applied, FileStore, NoteError, NoteSummary, Vault, VaultError};
 use tokio::sync::broadcast;
 
 const EVENT_QUEUE: usize = 64;
@@ -24,6 +26,19 @@ pub enum Event {
         /// The note's current body.
         body: String,
     },
+    /// The relay sync connection state changed.
+    Status(SyncStatus),
+}
+
+/// The relay sync connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// Not connected; will retry with backoff.
+    Offline,
+    /// Attempting to connect.
+    Connecting,
+    /// Connected and syncing.
+    Live,
 }
 
 /// Errors from [`Client`] operations.
@@ -78,6 +93,20 @@ impl Client {
         self.events.subscribe()
     }
 
+    /// Starts background websocket sync with the relay at `url`, for `graph`.
+    /// Remote changes flow into the same event stream as local edits, and local
+    /// edits are pushed. Reconnects with backoff; status is reported as events.
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn connect(&self, url: impl Into<String>, graph: impl Into<String>) {
+        tokio::spawn(sync::run(
+            Arc::clone(&self.vault),
+            self.events.clone(),
+            url.into(),
+            graph.into(),
+        ));
+    }
+
     /// Creates a note, returning its id.
     ///
     /// # Errors
@@ -129,9 +158,7 @@ impl Client {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vault> {
-        self.vault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        guard(&self.vault)
     }
 
     fn emit_note(&self, id: String, body: String) {
@@ -142,5 +169,31 @@ impl Client {
         let _ = self
             .events
             .send(Event::Notes(vault.list_notes(0, usize::MAX)));
+    }
+}
+
+fn guard(vault: &Mutex<Vault>) -> std::sync::MutexGuard<'_, Vault> {
+    vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Emits events for what a relay pull changed, reading current state once.
+fn emit_applied(vault: &Mutex<Vault>, events: &broadcast::Sender<Event>, applied: &Applied) {
+    let vault = guard(vault);
+    for id in &applied.notes {
+        let Ok(doc) = vault.get_note(id) else {
+            continue;
+        };
+        let Ok(body) = doc.body() else {
+            continue;
+        };
+        let _ = events.send(Event::Note {
+            id: id.clone(),
+            body,
+        });
+    }
+    if applied.list_changed {
+        let _ = events.send(Event::Notes(vault.list_notes(0, usize::MAX)));
     }
 }

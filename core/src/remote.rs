@@ -225,14 +225,18 @@ impl Vault {
     }
 
     /// Collects local changes not yet pushed for `graph`, as opaque blobs to
-    /// hand a relay. Does not advance sync state: [`Vault::apply_remote`] marks
-    /// them pushed when the relay echoes them back.
+    /// hand a relay, and marks them pushed.
     ///
     /// # Errors
     /// Returns an error if a store or automerge operation fails.
     pub fn collect_outgoing(&mut self, graph: &str) -> Result<Vec<Vec<u8>>, SyncError> {
-        let state = self.load_sync_state(graph)?;
-        self.gather_outgoing(&state, &NoCipher)
+        let mut state = self.load_sync_state(graph)?;
+        let outgoing = self.gather_outgoing(&state, &NoCipher)?;
+        if !outgoing.is_empty() {
+            self.refresh_pushed_heads(&mut state)?;
+            self.save_sync_state(graph, &state)?;
+        }
+        Ok(outgoing)
     }
 
     /// Applies change blobs pulled from a relay and advances `graph`'s cursor,
@@ -249,8 +253,8 @@ impl Vault {
         let mut state = self.load_sync_state(graph)?;
         let touched = self.apply_incoming(changes, &NoCipher)?;
         self.persist()?;
+        // Only advance the cursor here to prevent a pull from marking unsent local edits as pushed
         state.cursor = Some(cursor);
-        self.refresh_pushed_heads(&mut state)?;
         self.save_sync_state(graph, &state)?;
         Ok(Applied::from_touched(touched))
     }
