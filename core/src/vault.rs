@@ -121,10 +121,6 @@ impl Vault {
             .collect()
     }
 
-    pub(crate) fn root_heads(&mut self) -> Vec<ChangeHash> {
-        self.root.get_heads()
-    }
-
     pub(crate) fn root_changes_since(&mut self, have: &[ChangeHash]) -> Vec<Vec<u8>> {
         self.root
             .get_changes(have)

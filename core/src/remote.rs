@@ -6,9 +6,9 @@
 //! client pushes its new changes and pulls the rest since its
 //! cursor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use automerge::ChangeHash;
+use automerge::{Change, ChangeHash};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{NoteDoc, Vault, VaultError};
@@ -76,6 +76,29 @@ pub struct SyncOutcome {
     pub pushed: usize,
     /// Blobs received and applied.
     pub pulled: usize,
+}
+
+/// What a [`Vault::apply_remote`] changed, so a caller can react (e.g. re-render).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Note ids whose body changed.
+    pub notes: Vec<String>,
+    /// Whether the note list (metadata) changed.
+    pub list_changed: bool,
+}
+
+impl Applied {
+    fn from_touched(touched: Vec<String>) -> Self {
+        let mut applied = Self::default();
+        for id in touched {
+            if id == ROOT_DOC {
+                applied.list_changed = true;
+            } else {
+                applied.notes.push(id);
+            }
+        }
+        applied
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,13 +206,61 @@ impl Vault {
             return Err(SyncError::Snapshot);
         }
         let pulled = delta.changes.len();
-        self.apply_incoming(delta.changes, &cipher)?;
+        let applied = self.apply_incoming(delta.changes, &cipher)?;
         self.persist()?;
 
         state.cursor = Some(delta.cursor);
-        self.refresh_pushed_heads(&mut state)?;
+        advance_pushed(&mut state, &applied)?;
         self.save_sync_state(graph, &state)?;
         Ok(SyncOutcome { pushed, pulled })
+    }
+
+    /// The persisted cursor for `graph`, or `None` if it has never synced.
+    /// Used to say hello to a relay on connect.
+    ///
+    /// # Errors
+    /// Returns an error if the stored sync state is unreadable.
+    pub fn sync_cursor(&self, graph: &str) -> Result<Option<Cursor>, SyncError> {
+        Ok(self.load_sync_state(graph)?.cursor)
+    }
+
+    /// Collects local changes not yet on the relay for `graph`, as opaque blobs
+    /// to hand a relay.
+    ///
+    /// Pushed state is not advanced here: a change is marked pushed only once it
+    /// is echoed back through [`Vault::apply_remote`], which is the relay's
+    /// acknowledgement. So a send that never reaches the relay is retried, and
+    /// unsent local edits are never prematurely marked pushed.
+    ///
+    /// # Errors
+    /// Returns an error if a store or automerge operation fails.
+    pub fn collect_outgoing(&mut self, graph: &str) -> Result<Vec<Vec<u8>>, SyncError> {
+        let state = self.load_sync_state(graph)?;
+        self.gather_outgoing(&state, &NoCipher)
+    }
+
+    /// Applies change blobs pulled from a relay and advances `graph`'s cursor,
+    /// persisting the vault and sync state. Returns what changed.
+    ///
+    /// # Errors
+    /// Returns an error if a blob is malformed or a store/automerge op fails.
+    pub fn apply_remote(
+        &mut self,
+        graph: &str,
+        changes: Vec<Vec<u8>>,
+        cursor: Cursor,
+    ) -> Result<Applied, SyncError> {
+        let mut state = self.load_sync_state(graph)?;
+        let applied = self.apply_incoming(changes, &NoCipher)?;
+        self.persist()?;
+        let touched: Vec<String> = applied.keys().cloned().collect();
+        // Received changes are on the relay by definition, so mark them pushed
+        // (without disturbing unsent local heads). This acknowledges our own
+        // changes echoed back and stops us re-sending other devices' changes.
+        advance_pushed(&mut state, &applied)?;
+        state.cursor = Some(cursor);
+        self.save_sync_state(graph, &state)?;
+        Ok(Applied::from_touched(touched))
     }
 
     fn gather_outgoing(
@@ -214,43 +285,31 @@ impl Vault {
         Ok(out)
     }
 
+    /// Decrypts and applies `blobs`, returning the applied changes grouped by
+    /// doc id (so callers can both react to and record what arrived).
     fn apply_incoming(
         &mut self,
         blobs: Vec<Vec<u8>>,
         cipher: &impl Cipher,
-    ) -> Result<(), SyncError> {
+    ) -> Result<BTreeMap<String, Vec<Vec<u8>>>, SyncError> {
         let mut by_doc: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         for blob in blobs {
             let env = Envelope::decode(&cipher.decrypt(blob)?)?;
             by_doc.entry(env.doc_id).or_default().push(env.change);
         }
-        for (doc_id, changes) in by_doc {
+        for (doc_id, changes) in &by_doc {
             if doc_id == ROOT_DOC {
-                self.root_apply(changes)?;
+                self.root_apply(changes.clone())?;
                 continue;
             }
-            let mut note = match self.store_get(&doc_id)? {
+            let mut note = match self.store_get(doc_id)? {
                 Some(bytes) => NoteDoc::load(&bytes)?,
                 None => NoteDoc::empty(),
             };
-            note.apply(changes)?;
-            self.store_put(&doc_id, note.to_bytes())?;
+            note.apply(changes.clone())?;
+            self.store_put(doc_id, note.to_bytes())?;
         }
-        Ok(())
-    }
-
-    fn refresh_pushed_heads(&mut self, state: &mut SyncState) -> Result<(), SyncError> {
-        state.pushed.clear();
-        let root_heads = self.root_heads();
-        state.pushed.insert(ROOT_DOC.to_string(), Heads(root_heads));
-        for id in self.note_ids() {
-            let Some(bytes) = self.store_get(&id)? else {
-                continue;
-            };
-            let heads = NoteDoc::load(&bytes)?.heads();
-            state.pushed.insert(id, Heads(heads));
-        }
-        Ok(())
+        Ok(by_doc)
     }
 
     fn load_sync_state(&self, graph: &str) -> Result<SyncState, SyncError> {
@@ -272,6 +331,31 @@ impl Vault {
 
 fn heads_for<'a>(state: &'a SyncState, doc_id: &str) -> &'a [ChangeHash] {
     state.pushed.get(doc_id).map_or(&[], |h| h.0.as_slice())
+}
+
+/// Advances `pushed` to cover `applied` (changes now known to be on the relay),
+/// leaving unsent local-only heads untouched. For each doc the new frontier is
+/// the old pushed heads plus the applied change hashes, minus any hash that
+/// another applied change lists as a dependency.
+fn advance_pushed(
+    state: &mut SyncState,
+    applied: &BTreeMap<String, Vec<Vec<u8>>>,
+) -> Result<(), SyncError> {
+    for (doc_id, changes) in applied {
+        let mut frontier = heads_for(state, doc_id).to_vec();
+        let mut superseded: BTreeSet<ChangeHash> = BTreeSet::new();
+        for bytes in changes {
+            let change = Change::from_bytes(bytes.clone())
+                .map_err(|e| SyncError::Malformed(e.to_string()))?;
+            superseded.extend(change.deps().iter().copied());
+            frontier.push(change.hash());
+        }
+        frontier.retain(|h| !superseded.contains(h));
+        frontier.sort_unstable_by_key(|h| h.0);
+        frontier.dedup();
+        state.pushed.insert(doc_id.clone(), Heads(frontier));
+    }
+    Ok(())
 }
 
 fn sync_key(graph: &str) -> String {
@@ -418,6 +502,85 @@ mod tests {
         assert!(matches!(result, Err(SyncError::Snapshot)));
         // The cursor was not advanced, so a retry still starts from scratch.
         assert!(a.load_sync_state("g").unwrap().cursor.is_none());
+    }
+
+    #[test]
+    fn collect_outgoing_and_apply_remote_converge() {
+        // Simulate the websocket flow: A collects its changes, a relay assigns
+        // a cursor, B applies them via apply_remote.
+        let mut a = vault();
+        let (id, _) = a.create_note("n.md", "N", "hello").unwrap();
+        let outgoing = a.collect_outgoing("g").unwrap();
+        let cursor = Cursor {
+            epoch: 0,
+            seq: outgoing.len() as u64,
+        };
+
+        let mut b = vault();
+        let applied = b.apply_remote("g", outgoing, cursor).unwrap();
+
+        assert!(applied.list_changed);
+        assert_eq!(applied.notes, vec![id.clone()]);
+        assert_eq!(b.get_note(&id).unwrap().body().unwrap(), "hello");
+        assert_eq!(b.sync_cursor("g").unwrap(), Some(cursor));
+    }
+
+    #[test]
+    fn applied_remote_changes_are_not_pushed_back() {
+        // B receives A's changes; it must not echo them to the relay again.
+        let mut a = vault();
+        a.create_note("n.md", "N", "hello").unwrap();
+        let outgoing = a.collect_outgoing("g").unwrap();
+        let cursor = Cursor {
+            epoch: 0,
+            seq: outgoing.len() as u64,
+        };
+
+        let mut b = vault();
+        b.apply_remote("g", outgoing, cursor).unwrap();
+
+        assert!(b.collect_outgoing("g").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_change_stays_outgoing_until_its_echo_is_applied() {
+        // collect_outgoing must not advance pushed state: an unacknowledged send
+        // (which may have been lost) has to be retried until it echoes back.
+        let mut a = vault();
+        a.create_note("n.md", "N", "hello").unwrap();
+
+        let first = a.collect_outgoing("g").unwrap();
+        assert!(!first.is_empty());
+        let again = a.collect_outgoing("g").unwrap();
+        assert_eq!(again.len(), first.len());
+
+        // The relay echoes the batch back; now it is acknowledged.
+        let cursor = Cursor {
+            epoch: 0,
+            seq: first.len() as u64,
+        };
+        a.apply_remote("g", first, cursor).unwrap();
+        assert!(a.collect_outgoing("g").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unsent_local_edit_survives_an_unrelated_remote_batch() {
+        // A has an unpushed local note when an unrelated remote note arrives.
+        // Applying the remote batch must not mark A's local edit as pushed.
+        let mut a = vault();
+        a.create_note("local.md", "L", "mine").unwrap();
+
+        let mut other = vault();
+        other.create_note("remote.md", "R", "theirs").unwrap();
+        let incoming = other.collect_outgoing("g").unwrap();
+        let cursor = Cursor {
+            epoch: 0,
+            seq: incoming.len() as u64,
+        };
+        a.apply_remote("g", incoming, cursor).unwrap();
+
+        // A's own note is still waiting to be pushed.
+        assert!(!a.collect_outgoing("g").unwrap().is_empty());
     }
 
     #[test]

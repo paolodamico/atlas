@@ -15,8 +15,10 @@ workspace = true
 
 [dependencies]
 anyhow = "1"
+atlas-client = { path = "../client" }
 atlas-core = { path = "../core" }
 clap = { version = "4.6.4", features = ["derive"] }
 ciborium = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 ureq = "3.3.0"
