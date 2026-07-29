@@ -60,9 +60,9 @@ impl Target {
         let base = base.trim_end_matches('/');
         if base.is_empty()
             || graph.is_empty()
-            || graph.chars().all(|c| {
-                !c.is_control() && !c.is_whitespace() && !matches!(c, '/' | '?' | '#' | '%')
-            })
+            || graph
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '?' | '#' | '%'))
         {
             return None;
         }
