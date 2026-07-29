@@ -55,15 +55,21 @@ struct Target {
 }
 
 impl Target {
-    /// Builds the relay target URL
+    /// Builds the relay target URL, or `None` if the base URL or graph name
+    /// can't form one (so the caller stops instead of retrying a dead URL).
+    ///
+    /// The graph name goes raw into the URL path and the on-disk store key, so
+    /// it is limited to the URL-unreserved set (`A-Z a-z 0-9 - . _ ~`). An
+    /// allowlist, not a delimiter denylist: `http::Uri` (used by `connect_async`)
+    /// rejects bytes like `<`, `>`, and `` ` `` that a denylist would let through,
+    /// and the unreserved set is also filesystem-safe.
     fn parse(base: &str, graph: &str) -> Option<Self> {
         let base = base.trim_end_matches('/');
-        if base.is_empty()
-            || graph.is_empty()
-            || graph
+        let graph_ok = !graph.is_empty()
+            && graph
                 .chars()
-                .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '?' | '#' | '%'))
-        {
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'));
+        if base.is_empty() || !graph_ok {
             return None;
         }
         Some(Self {
@@ -271,7 +277,7 @@ mod tests {
         for bad in [
             "a/b", "a?b", "a#b", "a%20b", "a b", "a\tb", "a\u{0}b", "a<b", "a>b", "a`b", "café",
         ] {
-            assert!(Target::parse("ws://host", bad).is_none());
+            assert!(Target::parse("ws://host", bad).is_none(), "{bad:?}");
         }
     }
 
