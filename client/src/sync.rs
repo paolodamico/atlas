@@ -3,12 +3,14 @@
 //! local edits, so the host renders remote and local changes identically.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atlas_core::{Cursor, Vault};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
@@ -30,6 +32,9 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(40);
 /// How often to check the read timeout.
 const LIVENESS_CHECK: Duration = Duration::from_secs(10);
+/// Max change payload per push frame, so a big backlog goes out as several
+/// bounded messages the relay can accept instead of one it may reject.
+const PUSH_BYTES: usize = 256 * 1024;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -74,17 +79,13 @@ impl Target {
 
 /// A short, filesystem-safe token for a relay URL, so sync state is scoped per
 /// relay.
-///
-/// FNV-1a rather than [`std::hash::DefaultHasher`] because this key lives on
-/// disk: the algorithm has to stay fixed. If a rebuild hashed the same URL
-/// differently we'd lose the cursor and re-upload everything.
 fn relay_tag(base: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in base.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let digest = Sha256::digest(base.as_bytes());
+    let mut tag = String::with_capacity(16);
+    for byte in &digest[..8] {
+        let _ = write!(tag, "{byte:02x}");
     }
-    format!("{hash:016x}")
+    tag
 }
 
 /// Drives background sync for one graph: owns the shared context and reconnects
@@ -193,7 +194,9 @@ impl Syncer {
     }
 
     /// Sends local changes not yet pushed, skipping any already in flight (sent
-    /// but not yet echoed) so a slow echo does not make us resend duplicates.
+    /// but not yet echoed) so a slow echo doesn't make us resend duplicates. A
+    /// large backlog goes out as several [`PUSH_BYTES`]-bounded frames rather than
+    /// one the relay might reject, which would otherwise never converge.
     async fn push(
         &self,
         socket: &mut Socket,
@@ -203,17 +206,37 @@ impl Syncer {
         let Ok(changes) = guard(&self.vault).collect_outgoing(scope) else {
             return Ok(());
         };
-        let fresh: Vec<Vec<u8>> = changes
-            .into_iter()
-            .filter(|blob| !in_flight.contains(blob))
-            .collect();
-        if fresh.is_empty() {
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut batch_bytes = 0;
+        for blob in changes {
+            if in_flight.contains(&blob) {
+                continue;
+            }
+            if !batch.is_empty() && batch_bytes + blob.len() > PUSH_BYTES {
+                self.send_push(socket, in_flight, std::mem::take(&mut batch))
+                    .await?;
+                batch_bytes = 0;
+            }
+            batch_bytes += blob.len();
+            batch.push(blob);
+        }
+        if batch.is_empty() {
             return Ok(());
         }
-        for blob in &fresh {
+        self.send_push(socket, in_flight, batch).await
+    }
+
+    /// Marks `batch` in flight and sends it as one `Push` frame.
+    async fn send_push(
+        &self,
+        socket: &mut Socket,
+        in_flight: &mut HashSet<Vec<u8>>,
+        batch: Vec<Vec<u8>>,
+    ) -> Result<(), Disconnected> {
+        for blob in &batch {
             in_flight.insert(blob.clone());
         }
-        self.send(socket, &ClientMsg::Push { changes: fresh }).await
+        self.send(socket, &ClientMsg::Push { changes: batch }).await
     }
 
     async fn send(&self, socket: &mut Socket, msg: &ClientMsg) -> Result<(), Disconnected> {
