@@ -18,13 +18,14 @@ use tokio::time::interval;
 use super::sync::Cursor;
 use crate::store::MemStore;
 
-/// How often the relay pings idle peers. Keeps NAT/proxy paths warm and lets a
-/// dead half-open connection surface as a failed send.
+/// How often to ping idle peers: keeps NAT/proxy paths warm and lets a dead
+/// half-open connection surface as a failed send.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Chunk size to balance large catch-up backlog with timeouts. Keeps frames flowing
-/// so the connection stays (and is seen) alive.
-const CATCHUP_CHUNK: usize = 256;
+/// Max payload per catch-up frame. Splitting by bytes (not change count) keeps a
+/// big backlog flowing as steady frames instead of one giant message that could
+/// outlast the client's read timeout.
+const CATCHUP_BYTES: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 enum ClientMsg {
@@ -133,25 +134,29 @@ fn handle_incoming(
     }
 }
 
-/// Sends the catch-up backlog in [`CATCHUP_CHUNK`]-sized frames, each carrying
-/// the cursor it advances to. `from` is the client's starting seq; the running
-/// seq ends at `head` because `changes` is exactly the log tail after `from`.
-/// An empty backlog still sends one frame so the client learns the head.
+/// Streams the catch-up backlog as frames capped at [`CATCHUP_BYTES`], each
+/// carrying the seq it reaches. A change bigger than the cap can't be split, so
+/// it goes in its own frame. Intermediate frames use the running seq; the last
+/// carries `head`, which also covers an empty backlog.
 async fn send_catchup(
     socket: &mut WebSocket,
     changes: Vec<Vec<u8>>,
     from: u64,
     head: u64,
 ) -> Result<(), axum::Error> {
-    if changes.is_empty() {
-        return send_sync(socket, changes, head).await;
-    }
     let mut seq = from;
-    for chunk in changes.chunks(CATCHUP_CHUNK) {
-        seq += u64::try_from(chunk.len()).unwrap_or(0);
-        send_sync(socket, chunk.to_vec(), seq).await?;
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for change in changes {
+        if !batch.is_empty() && batch_bytes + change.len() > CATCHUP_BYTES {
+            seq += u64::try_from(batch.len()).unwrap_or(0);
+            send_sync(socket, std::mem::take(&mut batch), seq).await?;
+            batch_bytes = 0;
+        }
+        batch_bytes += change.len();
+        batch.push(change);
     }
-    Ok(())
+    send_sync(socket, batch, head).await
 }
 
 async fn send_sync(

@@ -55,14 +55,7 @@ struct Target {
 }
 
 impl Target {
-    /// Builds the relay target URL, or `None` if the base URL or graph name
-    /// can't form one (so the caller stops instead of retrying a dead URL).
-    ///
-    /// The graph name goes raw into the URL path and the on-disk store key, so
-    /// it is limited to the URL-unreserved set (`A-Z a-z 0-9 - . _ ~`). An
-    /// allowlist, not a delimiter denylist: `http::Uri` (used by `connect_async`)
-    /// rejects bytes like `<`, `>`, and `` ` `` that a denylist would let through,
-    /// and the unreserved set is also filesystem-safe.
+    /// Builds the target, or `None` if the URL or graph name can't form one
     fn parse(base: &str, graph: &str) -> Option<Self> {
         let base = base.trim_end_matches('/');
         let graph_ok = !graph.is_empty()
@@ -79,14 +72,12 @@ impl Target {
     }
 }
 
-/// A short, filesystem-safe token for a relay URL, used to scope persisted sync
-/// progress to the relay.
+/// A short, filesystem-safe token for a relay URL, so sync state is scoped per
+/// relay.
 ///
-/// FNV-1a, not [`std::hash::DefaultHasher`], because this is an on-disk key: its
-/// algorithm is fixed here, so a rebuilt client never re-hashes the same relay
-/// URL to a new scope and loses its cursor and pushed heads.
-///
-/// Reference: <https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function>
+/// FNV-1a rather than [`std::hash::DefaultHasher`] because this key lives on
+/// disk: the algorithm has to stay fixed. If a rebuild hashed the same URL
+/// differently we'd lose the cursor and re-upload everything.
 fn relay_tag(base: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in base.bytes() {
@@ -118,11 +109,9 @@ impl Syncer {
     }
 
     /// Connects, runs a session until the socket drops, then backs off and
-    /// retries. Reports connection state as [`Event::Status`].
-    ///
-    /// The backoff is reset only after a session stays up long enough to be
-    /// healthy, so a relay that flaps (accepts then immediately closes) is
-    /// backed off instead of hammered.
+    /// retries, reporting state as [`Event::Status`]. Backoff resets only after a
+    /// session stays up long enough to be healthy, so a flapping relay (accept
+    /// then immediately close) isn't hammered.
     pub(crate) async fn run(self, url: String) {
         let Some(target) = Target::parse(&url, &self.graph) else {
             self.set_status(SyncStatus::Offline);
@@ -180,12 +169,10 @@ impl Syncer {
         }
     }
 
-    /// Applies one remote batch and emits events for what changed. A malformed
-    /// frame is skipped, but a failed apply is surfaced so the session drops and
-    /// reconnects from the unchanged cursor rather than skipping those changes.
-    ///
-    /// Echoed blobs are cleared from `in_flight` first: the relay has now
-    /// acknowledged them, so they are no longer pending a resend.
+    /// Applies one remote batch and emits what changed. A malformed frame is
+    /// skipped; a failed apply is surfaced so the session drops and reconnects
+    /// from the unchanged cursor instead of losing those changes. Echoed blobs
+    /// clear from `in_flight` first, since the relay has now acknowledged them.
     fn apply(
         &self,
         scope: &str,
