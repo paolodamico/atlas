@@ -98,3 +98,45 @@ async fn catch_up_replays_existing_changes() {
     send_msg(&mut b, &ClientMsg::Hello { since: None }).await;
     assert_eq!(recv_sync(&mut b).await.changes, vec![b"one".to_vec()]);
 }
+
+#[tokio::test]
+async fn large_catch_up_is_chunked_by_byte_size_with_advancing_cursors() {
+    let url = start_relay().await;
+    let (mut a, _) = connect_async(url.as_str()).await.unwrap();
+    send_msg(&mut a, &ClientMsg::Hello { since: None }).await;
+    recv_sync(&mut a).await;
+
+    // Twenty 128 KiB changes: ~2.5 MiB total, well over the per-frame byte cap,
+    // so catch-up must split it into several frames. Distinct fill bytes let us
+    // verify the reassembled backlog exactly.
+    let all: Vec<Vec<u8>> = (0..20u8).map(|i| vec![i; 128 * 1024]).collect();
+    send_msg(
+        &mut a,
+        &ClientMsg::Push {
+            changes: all.clone(),
+        },
+    )
+    .await;
+    assert_eq!(recv_sync(&mut a).await.cursor.seq, 20);
+
+    // A late joiner receives the backlog across several byte-bounded frames whose
+    // cursors strictly advance to exactly the head, with no gap or overlap.
+    let (mut b, _) = connect_async(url.as_str()).await.unwrap();
+    send_msg(&mut b, &ClientMsg::Hello { since: None }).await;
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    let mut frames = 0;
+    let mut last_seq = 0;
+    while got.len() < all.len() {
+        let msg = recv_sync(&mut b).await;
+        assert!(!msg.changes.is_empty());
+        got.extend(msg.changes);
+        // The cursor is the absolute seq of the last change in this frame.
+        assert_eq!(usize::try_from(msg.cursor.seq).unwrap(), got.len());
+        assert!(msg.cursor.seq > last_seq, "cursors must advance");
+        last_seq = msg.cursor.seq;
+        frames += 1;
+    }
+    assert_eq!(got, all);
+    assert_eq!(last_seq, 20, "final cursor is the head");
+    assert!(frames > 1, "a large backlog must span multiple frames");
+}

@@ -12,13 +12,14 @@ workspace = true
 [dependencies]
 atlas-core = { path = "../core" }
 ciborium = { workspace = true }
-futures-util = "0.3.33"
+futures-util = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "net", "time", "macros"] }
-tokio-tungstenite = "0.30.0"
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 atlas-relay = { path = "../relay" }
-axum = { version = "0.8.9", features = ["ws"] }
-tempfile = "3.27.0"
+axum = { workspace = true }
+tempfile = { workspace = true }
