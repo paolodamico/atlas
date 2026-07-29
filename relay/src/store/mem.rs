@@ -1,9 +1,9 @@
-//! In-memory blob storage: an append-only log per graph.
-//!
-//! TODO: Redis backend
+//! In-memory append-only log, kept for tests that do not need a running Redis.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use crate::store::{Store, StoreError};
 
 /// Append-only log of opaque blobs per graph. Cheap to clone.
 #[derive(Clone, Default)]
@@ -12,13 +12,10 @@ pub struct MemStore {
 }
 
 impl MemStore {
-    /// Appends `blobs` to `graph`, then returns its blobs at or after `from`
-    /// together with the new head sequence.
-    ///
     /// Append, read, and head share one lock: a concurrent append can't slip
     /// between the read and the head and advance a client's cursor past
     /// changes it never received.
-    pub fn append_and_read(
+    fn locked_append_and_read(
         &self,
         graph: &str,
         blobs: Vec<Vec<u8>>,
@@ -37,6 +34,17 @@ impl MemStore {
     }
 }
 
+impl Store for MemStore {
+    async fn append_and_read(
+        &self,
+        graph: &str,
+        blobs: Vec<Vec<u8>>,
+        from: u64,
+    ) -> Result<(Vec<Vec<u8>>, u64), StoreError> {
+        Ok(self.locked_append_and_read(graph, blobs, from))
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
 mod tests {
@@ -48,14 +56,14 @@ mod tests {
         let handles: Vec<_> = (0..8u8)
             .map(|i| {
                 let store = store.clone();
-                std::thread::spawn(move || store.append_and_read("g", vec![vec![i]], 0))
+                std::thread::spawn(move || store.locked_append_and_read("g", vec![vec![i]], 0))
             })
             .collect();
         for handle in handles {
             handle.join().unwrap();
         }
 
-        let (all, head) = store.append_and_read("g", Vec::new(), 0);
+        let (all, head) = store.locked_append_and_read("g", Vec::new(), 0);
         assert_eq!(head, 8);
         assert_eq!(all.len() as u64, head);
     }
