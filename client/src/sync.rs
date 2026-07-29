@@ -3,7 +3,6 @@
 //! local edits, so the host renders remote and local changes identically.
 
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,11 +74,20 @@ impl Target {
 }
 
 /// A short, filesystem-safe token for a relay URL, used to scope persisted sync
-/// progress to the relay. Only needs to be stable within one device's lifetime.
+/// progress to the relay.
+///
+/// FNV-1a, not [`std::hash::DefaultHasher`], because this is an on-disk key: its
+/// algorithm is fixed here, so a rebuilt client never re-hashes the same relay
+/// URL to a new scope and loses its cursor and pushed heads.
+///
+/// Reference: <https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function>
 fn relay_tag(base: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    base.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in base.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Drives background sync for one graph: owns the shared context and reconnects
@@ -241,7 +249,7 @@ enum Disconnected {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
 mod tests {
-    use super::{Target, relay_tag, valid_graph};
+    use super::{Target, relay_tag};
 
     #[test]
     fn trailing_slash_in_base_url_is_normalized() {
@@ -250,10 +258,19 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_graph_names_are_accepted() {
+        for good in ["demo", "g", "notes-2026", "a.b_c"] {
+            assert!(Target::parse("ws://host", good).is_some());
+        }
+    }
+
+    #[test]
     fn graph_names_that_would_corrupt_the_path_are_rejected() {
         assert!(Target::parse("ws://host", "").is_none());
-        for bad in ["a/b", "a?b", "a#b", "a%20b", "a b", "a\tb", "a\u{0}b"] {
-            assert!(!valid_graph(bad), "{bad:?} should be rejected");
+
+        for bad in [
+            "a/b", "a?b", "a#b", "a%20b", "a b", "a\tb", "a\u{0}b", "a<b", "a>b", "a`b", "café",
+        ] {
             assert!(Target::parse("ws://host", bad).is_none());
         }
     }

@@ -20,7 +20,11 @@ use crate::store::MemStore;
 
 /// How often the relay pings idle peers. Keeps NAT/proxy paths warm and lets a
 /// dead half-open connection surface as a failed send.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Chunk size to balance large catch-up backlog with timeouts. Keeps frames flowing
+/// so the connection stays (and is seen) alive.
+const CATCHUP_CHUNK: usize = 256;
 
 #[derive(Deserialize)]
 enum ClientMsg {
@@ -48,9 +52,12 @@ async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
     };
     // Subscribe and read catch-up atomically: the subscription then carries
     // exactly the changes appended after `head`, so counting them tracks it.
-    let (mut updates, changes, mut head) =
-        store.subscribe_and_read(&graph, since.map_or(0, |c| c.seq));
-    if send_sync(&mut socket, changes, head).await.is_err() {
+    let from = since.map_or(0, |c| c.seq);
+    let (mut updates, changes, mut head) = store.subscribe_and_read(&graph, from);
+    if send_catchup(&mut socket, changes, from, head)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -124,6 +131,27 @@ fn handle_incoming(
         None | Some(Err(_) | Ok(Message::Close(_))) => ControlFlow::Break(()),
         Some(Ok(_)) => ControlFlow::Continue(()),
     }
+}
+
+/// Sends the catch-up backlog in [`CATCHUP_CHUNK`]-sized frames, each carrying
+/// the cursor it advances to. `from` is the client's starting seq; the running
+/// seq ends at `head` because `changes` is exactly the log tail after `from`.
+/// An empty backlog still sends one frame so the client learns the head.
+async fn send_catchup(
+    socket: &mut WebSocket,
+    changes: Vec<Vec<u8>>,
+    from: u64,
+    head: u64,
+) -> Result<(), axum::Error> {
+    if changes.is_empty() {
+        return send_sync(socket, changes, head).await;
+    }
+    let mut seq = from;
+    for chunk in changes.chunks(CATCHUP_CHUNK) {
+        seq += u64::try_from(chunk.len()).unwrap_or(0);
+        send_sync(socket, chunk.to_vec(), seq).await?;
+    }
+    Ok(())
 }
 
 async fn send_sync(

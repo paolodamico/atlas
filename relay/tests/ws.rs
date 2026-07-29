@@ -98,3 +98,40 @@ async fn catch_up_replays_existing_changes() {
     send_msg(&mut b, &ClientMsg::Hello { since: None }).await;
     assert_eq!(recv_sync(&mut b).await.changes, vec![b"one".to_vec()]);
 }
+
+#[tokio::test]
+async fn large_catch_up_is_chunked_with_advancing_cursors() {
+    let url = start_relay().await;
+    let (mut a, _) = connect_async(url.as_str()).await.unwrap();
+    send_msg(&mut a, &ClientMsg::Hello { since: None }).await;
+    recv_sync(&mut a).await;
+
+    // More than one chunk's worth of changes (chunk size is 256).
+    let all: Vec<Vec<u8>> = (0..600usize).map(|i| i.to_le_bytes().to_vec()).collect();
+    send_msg(
+        &mut a,
+        &ClientMsg::Push {
+            changes: all.clone(),
+        },
+    )
+    .await;
+    // The live fan-out echoes the whole batch in one frame at the final head.
+    assert_eq!(recv_sync(&mut a).await.cursor.seq, 600);
+
+    // A late joiner receives the backlog across several bounded frames whose
+    // cursors advance to exactly the head, with no gap or overlap.
+    let (mut b, _) = connect_async(url.as_str()).await.unwrap();
+    send_msg(&mut b, &ClientMsg::Hello { since: None }).await;
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    let mut frames = 0;
+    while got.len() < all.len() {
+        let msg = recv_sync(&mut b).await;
+        assert!(!msg.changes.is_empty() && msg.changes.len() <= 256);
+        got.extend(msg.changes);
+        // The cursor is the absolute seq of the last change in this frame.
+        assert_eq!(usize::try_from(msg.cursor.seq).unwrap(), got.len());
+        frames += 1;
+    }
+    assert_eq!(got, all);
+    assert_eq!(frames, 3, "600 changes should arrive as 256 + 256 + 88");
+}
