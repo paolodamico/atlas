@@ -90,6 +90,32 @@ async fn log_persists_across_reconnects() {
 }
 
 #[tokio::test]
+async fn append_fans_out_live_and_persists_for_late_joiners() {
+    let (_node, store) = redis_store().await;
+
+    // Subscribe with an empty catch-up, then append through a clone of the store
+    // (as the websocket push path does).
+    let (mut updates, catchup, head) = store.subscribe_and_read("g", 0).await.unwrap();
+    assert!(catchup.is_empty());
+    assert_eq!(head, 0);
+
+    store
+        .clone()
+        .append("g", vec![b"a".to_vec(), b"b".to_vec()])
+        .await
+        .unwrap();
+
+    // The live subscriber receives exactly the appended batch, in order.
+    let batch = updates.recv().await.unwrap();
+    assert_eq!(batch, vec![b"a".to_vec(), b"b".to_vec()]);
+
+    // A late joiner gets the same data as durable catch-up read from Redis.
+    let (_late, catchup, head) = store.subscribe_and_read("g", 0).await.unwrap();
+    assert_eq!(head, 2);
+    assert_eq!(catchup, vec![b"a".to_vec(), b"b".to_vec()]);
+}
+
+#[tokio::test]
 async fn concurrent_appends_stay_atomic() {
     let (_node, store) = redis_store().await;
     let handles: Vec<_> = (0..8u8)

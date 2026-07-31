@@ -1,0 +1,25 @@
+[package]
+name = "atlas-client"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+atlas-core = { path = "../core" }
+ciborium = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "net", "time", "macros"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+atlas-relay = { path = "../relay" }
+axum = { workspace = true }
+tempfile = { workspace = true }

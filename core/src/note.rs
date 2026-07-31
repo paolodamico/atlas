@@ -113,10 +113,6 @@ impl NoteDoc {
         }
     }
 
-    pub(crate) fn heads(&mut self) -> Vec<ChangeHash> {
-        self.doc.get_heads()
-    }
-
     pub(crate) fn changes_since(&mut self, have: &[ChangeHash]) -> Vec<Vec<u8>> {
         self.doc
             .get_changes(have)
