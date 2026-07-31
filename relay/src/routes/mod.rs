@@ -6,8 +6,10 @@ pub(crate) mod ws;
 
 use axum::Router;
 
-pub fn router() -> Router {
+use crate::store::Store;
+
+pub fn router<S: Store>() -> Router {
     Router::new()
-        .route("/graphs/{graph}/sync", post(sync::handler))
-        .route("/graphs/{graph}/ws", get(ws::handler))
+        .route("/graphs/{graph}/sync", post(sync::handler::<S>))
+        .route("/graphs/{graph}/ws", get(ws::handler::<S>))
 }

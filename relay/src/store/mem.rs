@@ -1,21 +1,16 @@
 //! In-memory log store plus update propagation to all subscribers.
 //!
-//! Each graph is a `Vec` of opaque blobs and a broadcast channel. Appending
-//! extends the log and publishes the appended blobs under one lock, so
-//! websocket subscribers receive them in log order with no gaps.
-//!
-//! TODO: Redis backend
+//! Kept for tests that do not need a running Redis. Each graph is a `Vec` of
+//! opaque blobs and a broadcast channel; appending extends the log and
+//! publishes the appended blobs under one lock, so websocket subscribers
+//! receive them in log order with no gaps.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-/// Maximum subscriber capacity per graph.
-const FANOUT_CAPACITY: usize = 128;
-
-/// A batch of change blobs (each blob is one opaque change).
-type Changes = Vec<Vec<u8>>;
+use crate::store::{Changes, FANOUT_CAPACITY, Store, StoreError};
 
 /// One graph's durable log and its live broadcast tail. The broadcast carries
 /// just the newly appended blobs; each subscriber tracks its own head by
@@ -55,50 +50,13 @@ impl GraphLog {
     }
 }
 
-/// In-memory log store, cheap to clone (shared inner)
+/// In-memory log store, cheap to clone (shared inner).
 #[derive(Clone, Default)]
 pub struct MemStore {
     graphs: Arc<Mutex<HashMap<String, GraphLog>>>,
 }
 
 impl MemStore {
-    /// Appends `blobs` to `graph`, then returns its blobs at or after `from`
-    /// with the new head. One lock spans append, publish, read, and head, so a
-    /// concurrent append can't reorder or advance a cursor past
-    /// changes a client never received.
-    #[must_use]
-    pub fn append_and_read(&self, graph: &str, blobs: Changes, from: u64) -> (Changes, u64) {
-        let mut graphs = self.lock();
-        let log = graphs.entry(graph.to_string()).or_default();
-        let head = log.append(blobs);
-        (log.read_from(from), head)
-    }
-
-    /// Appends `blobs` to `graph`. Websocket pushers get the appended blobs
-    /// back through their subscription (with the new head), so no return here.
-    pub fn append(&self, graph: &str, blobs: Changes) {
-        self.lock()
-            .entry(graph.to_string())
-            .or_default()
-            .append(blobs);
-    }
-
-    /// Subscribes to `graph`'s live updates and reads catch-up from `from`,
-    /// both under one lock. Subscribing and reading atomically means the
-    /// subscriber receives exactly the blobs appended after `head`, contiguous
-    /// with no overlap, so it can track its head by counting them.
-    #[must_use]
-    pub fn subscribe_and_read(
-        &self,
-        graph: &str,
-        from: u64,
-    ) -> (broadcast::Receiver<Changes>, Changes, u64) {
-        let mut graphs = self.lock();
-        let log = graphs.entry(graph.to_string()).or_default();
-        let updates = log.updates.subscribe();
-        (updates, log.read_from(from), log.head())
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, GraphLog>> {
         self.graphs
             .lock()
@@ -106,25 +64,59 @@ impl MemStore {
     }
 }
 
+impl Store for MemStore {
+    async fn append_and_read(
+        &self,
+        graph: &str,
+        blobs: Changes,
+        from: u64,
+    ) -> Result<(Changes, u64), StoreError> {
+        let mut graphs = self.lock();
+        let log = graphs.entry(graph.to_string()).or_default();
+        let head = log.append(blobs);
+        Ok((log.read_from(from), head))
+    }
+
+    async fn append(&self, graph: &str, blobs: Changes) -> Result<(), StoreError> {
+        self.lock()
+            .entry(graph.to_string())
+            .or_default()
+            .append(blobs);
+        Ok(())
+    }
+
+    async fn subscribe_and_read(
+        &self,
+        graph: &str,
+        from: u64,
+    ) -> Result<(broadcast::Receiver<Changes>, Changes, u64), StoreError> {
+        let mut graphs = self.lock();
+        let log = graphs.entry(graph.to_string()).or_default();
+        let updates = log.updates.subscribe();
+        Ok((updates, log.read_from(from), log.head()))
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests read better with unwrap/expect")]
 mod tests {
     use super::MemStore;
+    use crate::store::Store;
 
-    #[test]
-    fn concurrent_appends_all_land_and_stay_consistent() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_all_land_and_stay_consistent() {
         let store = MemStore::default();
         let handles: Vec<_> = (0..8u8)
             .map(|i| {
                 let store = store.clone();
-                std::thread::spawn(move || store.append_and_read("g", vec![vec![i]], 0))
+                tokio::spawn(async move { store.append_and_read("g", vec![vec![i]], 0).await })
             })
             .collect();
         for handle in handles {
-            handle.join().unwrap();
+            handle.await.unwrap().unwrap();
         }
 
-        let (all, head) = store.append_and_read("g", Vec::new(), 0);
+        let (all, head) = store.append_and_read("g", Vec::new(), 0).await.unwrap();
         assert_eq!(head, 8);
         assert_eq!(all.len() as u64, head);
     }

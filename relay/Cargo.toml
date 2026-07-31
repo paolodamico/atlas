@@ -18,6 +18,11 @@ serde = { workspace = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 schemars = "1.2.1"
+redis = { version = "1.4.1", default-features = false, features = [
+    "tokio-comp",
+    "connection-manager",
+    "script",
+] }
 
 [dev-dependencies]
 futures-util = { workspace = true }
@@ -25,3 +30,4 @@ serde_json = "1.0.151"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-tungstenite = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }
+testcontainers-modules = { version = "0.15.0", features = ["redis"] }

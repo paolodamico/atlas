@@ -16,7 +16,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::interval;
 
 use super::sync::Cursor;
-use crate::store::MemStore;
+use crate::store::Store;
 
 /// How often to ping idle peers: keeps NAT/proxy paths warm and lets a dead
 /// half-open connection surface as a failed send.
@@ -39,22 +39,28 @@ struct ServerMsg {
     cursor: Cursor,
 }
 
-pub(super) async fn handler(
+pub(super) async fn handler<S: Store>(
     upgrade: WebSocketUpgrade,
     Path(graph): Path<String>,
-    Extension(store): Extension<MemStore>,
+    Extension(store): Extension<S>,
 ) -> Response {
     upgrade.on_upgrade(move |socket| serve(socket, graph, store))
 }
 
-async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
+async fn serve<S: Store>(mut socket: WebSocket, graph: String, store: S) {
     let Some(since) = hello(&mut socket).await else {
         return;
     };
     // Subscribe and read catch-up atomically: the subscription then carries
     // exactly the changes appended after `head`, so counting them tracks it.
     let from = since.map_or(0, |c| c.seq);
-    let (mut updates, changes, mut head) = store.subscribe_and_read(&graph, from);
+    let (mut updates, changes, mut head) = match store.subscribe_and_read(&graph, from).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!(%graph, %error, "store error subscribing to graph");
+            return;
+        }
+    };
     if send_catchup(&mut socket, changes, from, head)
         .await
         .is_err()
@@ -67,7 +73,7 @@ async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
     loop {
         tokio::select! {
             incoming = socket.recv() => {
-                if handle_incoming(incoming, &graph, &store).is_break() {
+                if handle_incoming(incoming, &graph, &store).await.is_break() {
                     break;
                 }
             }
@@ -86,10 +92,17 @@ async fn serve(mut socket: WebSocket, graph: String, store: MemStore) {
                     // Fell behind the ring: re-subscribe and re-read atomically,
                     // dropping the stale buffer and realigning head to the log.
                     Err(RecvError::Lagged(_)) => {
-                        let (fresh, missed, new_head) = store.subscribe_and_read(&graph, head);
-                        updates = fresh;
-                        head = new_head;
-                        send_sync(&mut socket, missed, head).await
+                        match store.subscribe_and_read(&graph, head).await {
+                            Ok((fresh, missed, new_head)) => {
+                                updates = fresh;
+                                head = new_head;
+                                send_sync(&mut socket, missed, head).await
+                            }
+                            Err(error) => {
+                                tracing::error!(%graph, %error, "store error re-subscribing to graph");
+                                break;
+                            }
+                        }
                     }
                     Err(RecvError::Closed) => break,
                 };
@@ -117,15 +130,18 @@ async fn hello(socket: &mut WebSocket) -> Option<Option<Cursor>> {
     }
 }
 
-fn handle_incoming(
+async fn handle_incoming<S: Store>(
     incoming: Option<Result<Message, axum::Error>>,
     graph: &str,
-    store: &MemStore,
+    store: &S,
 ) -> ControlFlow<()> {
     match incoming {
         Some(Ok(Message::Binary(bytes))) => {
-            if let Some(ClientMsg::Push { changes }) = decode(&bytes) {
-                store.append(graph, changes);
+            if let Some(ClientMsg::Push { changes }) = decode(&bytes)
+                && let Err(error) = store.append(graph, changes).await
+            {
+                tracing::error!(%graph, %error, "store error appending to graph");
+                return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
         }

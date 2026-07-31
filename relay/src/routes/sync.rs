@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::store::MemStore;
+use crate::store::Store;
 
 /// Position in a graph's append-only log; seq restarts each snapshot `epoch`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
@@ -39,16 +39,22 @@ pub struct SyncResponse {
 }
 
 #[instrument(skip(store, body), fields(graph = %graph, bytes = body.len()))]
-pub(super) async fn handler(
+pub(super) async fn handler<S: Store>(
     Path(graph): Path<String>,
-    Extension(store): Extension<MemStore>,
+    Extension(store): Extension<S>,
     body: Bytes,
 ) -> Result<Vec<u8>, StatusCode> {
     let request: SyncRequest =
         ciborium::from_reader(body.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let pushed = request.changes.len();
     let from = request.since.map_or(0, |c| c.seq);
-    let (changes, seq) = store.append_and_read(&graph, request.changes, from);
+    let (changes, seq) = store
+        .append_and_read(&graph, request.changes, from)
+        .await
+        .map_err(|e| {
+            tracing::error!("store error syncing graph: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let response = SyncResponse {
         changes,
         cursor: Cursor { epoch: 0, seq },
